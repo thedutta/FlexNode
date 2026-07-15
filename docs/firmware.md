@@ -62,10 +62,13 @@ Measured (moteus HEAD, fw 0x000105, repo-pinned Bazel in WSL Ubuntu-22.04):
 ## Build & flash
 
 ```bash
-# in WSL (Ubuntu-22.04), from the moteus fork root
+# in WSL (Ubuntu-22.04) — build from inside moteus-r4-parent/ (its WORKSPACE is the build root)
+cd moteus-r4-parent
 tools/bazel build --config=target //:target      # repo-pinned Bazel 7.4.1
 # flash via the moteus bootloader / SWD (P1 header: SWDIO=PA13, SWCLK=PA14, NRST)
 ```
+
+FlexNode's firmware edits live in `moteus-r4-parent/fw/`.
 
 First-article checklist before trusting flash writes: exercise the config-write path (`0x807f000`) with a power-cycle, and optionally confirm `DBANK = 1` via CubeProgrammer on the G473 die.
 

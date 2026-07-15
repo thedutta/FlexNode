@@ -1,72 +1,88 @@
-# moteus brushless servo #
+# FlexNode
 
-This contains full designs for the moteus brushless servo actuator,
-including firmware and PCBs.
+**A distributed compute node for mobile robots — high-current FOC actuation and sensor fusion, all over CAN-FD.**
 
-**WARNING**: This is not just a software project.  It includes designs
-for moderately high power electronics.  It has not yet burned down my
-(or anyone's that I know of) house, but there are no guarantees.
+> ⚠️ **Work in progress.** FlexNode v1.0 boards have been fabricated; hardware bring-up and the firmware port are in progress. Schematics, BOM, and gerbers here are the as-ordered v1.0 design. Expect breaking changes until the first article is validated.
 
+---
 
-# Specifications #
+## What it is
 
-| Name                   | r4.11        | c1         | n1        | x1          |
-|------------------------|--------------|------------|-----------|-------------|
-| Voltage Input          | 10-44V       | 10-51V     | 10-54V    | 10-54V      |
-| Peak Electrical Power  | 900W @ 30V   | 250W @ 28V | 2kW @ 36V | 1.3kW @ 36V |
-| Mass                   | 14.2g        | 8.9g       | 14.6g     | 23.8g       |
-| Control Rate           | 15-30kHz     | -          | -         | -           |
-| PWM Switching Rate     | 15-60kHz     | -          | -         | -           |
-| CPU                    | STM32G4      | -          | -         | -           |
-| Uncooled phase current | 12A          | 5A         | 9A       | 25A         |
-| Cooled phase current   | 32A          | 14A        | 26A       | 62A         |
-| Peak phase current     | 100A         | 20A        | 100A      | 120A        |
-| Communications         | 5Mbps CAN-FD | -          | -         | -           |
-| Dimensions             | 46x53mm      | 38x38x9mm  | 46x46x8mm | 56x56x10mm  |
+FlexNode is a compact PCB that fuses a **field-oriented motor controller** and a **sensor-fusion front end** into a single node that hangs off a **CAN-FD** bus. Many nodes daisy-chain back to a host (a Jetson on the target robot), so each limb or joint gets local, hard-real-time control while the host does high-level planning.
 
-Assembled and tested boards can be purchased at: https://mjbots.com
+It began as a fork of the [mjbots **moteus r4.11**](https://github.com/mjbots/moteus) controller — the proven power stage, gate driver, and STM32G4 core are kept intact — and adds the digital sensing and I/O a distributed robot node needs:
 
+- **6-axis IMU** (accel + gyro) for per-node inertial sensing
+- **Multizone time-of-flight** ranging (8×8) for proximity / terrain
+- **Servo / Aux port** with onboard 5 V current sensing
+- **Dedicated i2c port** for secondary encoders or other i2c peripherals
+- **SPI pads** for spi peripherals using existing gpios on ports as cs lines
+- **Addressable RGB status** (WS2812)
+- Everything reported and commanded over **CAN-FD**
 
-# Directory structure #
+The design target is **CATBOT**, a 4.1 kg ultra-nimble jumping quadruped: FlexNode drives its high-torque geared hip actuators and its lighter leg motors, one node per actuator, all chained to the onboard Jetson, all either JST-PH or directly soldered, no space for XT90s.
 
-* hw/ - hardware (mechanical and electrical designs)
-  * controller/ - PCB design for moteus-r4.11
-  * c1/ - PCB design for moteus-c1
-  * n1/ - PCB design for moteus-n1
-  * x1/ - PCB design for moteus-x1
-* fw/ - firmware for brushless controller
-* lib/ - client side software
-* utils/ - diagnostic tools
-* tools/ - bazel build configure
-* docs/ - documentation
+## Core specs (v1.0)
 
-# Documentation #
+| Domain | Part / value |
+|---|---|
+| MCU | STM32G473CEU6 / G474CEU6 — Cortex-M4F @170 MHz, 512 KB flash, 128 KB RAM, 5× ADC, 6× op-amp, 3× FDCAN, UFQFPN48 |
+| Gate driver | TI DRV8353S (3-phase, SPI-configurable) |
+| Power FETs | Infineon BSC016N06NS — 60 V, 1.6 mΩ, TDSON-8 |
+| Motor supply | Up to ~44 V bus (10S LiPo class) |
+| Aux rail | LGS5160C sync buck (→ 5 V) + MCP1700 LDO (→ 3.3 V) |
+| Rotor feedback | AS5047P magnetic encoder (SPI, on-axis) |
+| Comms | CAN-FD via TCAN334G, daisy-chain in/out, leaf-node 120 Ω termination |
+| IMU | ST LSM6DS3TR-C (I²C) |
+| ToF | ST VL53L7CX 8×8 multizone (I²C) |
+| Status | WS2812B addressable LED |
+| Aux I/O | Servo / LED output + 5 V shunt current sense + i2c programmable port + dual can ports , all JST-PH|
+| Stackup | 4-layer, 1 oz copper (thermally validated for CATBOT's real phase currents, upgrade to 2oz on all layers for moteus current capability) |
 
-* [Quick Start](https://mjbots.github.io/moteus/quick-start)
-* [All Documentation](https://mjbots.github.io/moteus/)
-* [Discord](https://discord.gg/W4hUpBb)
+## Firmware
 
-# Misc #
+Firmware is a fork of moteus, retaining its FOC inner loop and CAN protocol while remapping the pins FlexNode reuses and adding the sensor/aux features. Key deltas from stock moteus are documented in [`docs/firmware.md`](docs/firmware.md); the highlights:
 
- * [![CI Status](https://github.com/mjbots/moteus/actions/workflows/ci.yml/badge.svg)](https://github.com/mjbots/moteus/actions/workflows/ci.yml)
+- **Board ID is hardcoded** to `{family = 0, hw_version = 8}` — FlexNode repurposes the strap pins (PB11, PC6), so runtime hardware detection is bypassed. `hw_version = 8` selects the correct DRV8353 register tables and r4.11 analog map.
+- **Pin remaps**: `PB11 → 5 V current sense`, `PC6 → AS5047 CS`, `PC13 → servo/LED`.
+- **Phase-order fix**: the motor PWM phase A/C outputs are swapped in copper relative to moteus while the current-sense wiring matches moteus; firmware compensates by swapping the current-sense channel assignment (phase-0 ↔ phase-2) so drive and sense stay on the same physical phase. See [`docs/firmware.md`](docs/firmware.md#phase-order).
+- **Flash budget**: the moteus application image is ~410 KiB; on the 512 KB part that leaves ~35 KiB for FlexNode's added features — ample if they reuse moteus's non-blocking I²C / SPI-DMA / FDCAN primitives and never block the FOC ISR.
 
-# How to support moteus development #
+## Repository layout
 
-The easiest way to support development the moteus hardware and firmware is as follows:
+FlexNode's files live at the repo root; the upstream **moteus r4** project this forks from is kept intact underneath, in `moteus-r4-parent/`:
 
-1) Buy things from https://mjbots.com
-2) Build awesome machines!
+```
+<repo root>/                     ← FlexNode
+├── README.md                    ← you are here
+├── docs/
+│   ├── hardware.md              hardware architecture, pin map, power tree
+│   ├── firmware.md              firmware port: remaps, hw_version, build/flash
+│   └── roadmap.md               status and next steps
+├── hardware/
+│   ├── FlexNode_schematics.pdf  v1.0 schematic (as ordered)
+│   ├── CAD/                     3D model (STEP)
+│   ├── manufacturing/           BOM, gerber archive, pick-and-place
+│   └── gerbers/                 unpacked gerbers
+├── LICENSE                      Apache-2.0 (inherited from moteus)
+└── moteus-r4-parent/            ← the moteus r4.11 fork FlexNode builds on
+    ├── fw/ hw/ lib/ tools/ …    moteus firmware + build system
+    ├── README.md                moteus's own readme
+    └── LICENSE                  moteus's original Apache-2.0 (preserved)
+```
 
-That's it!  If for some reason you want to go above and beyond, you can sponsor mjbots through github: https://github.com/sponsors/mjbots
+> **Firmware lives in `moteus-r4-parent/`** and builds from *inside* that directory — its Bazel `WORKSPACE` is the build root. FlexNode's firmware deltas go into `moteus-r4-parent/fw/` (see [`docs/firmware.md`](docs/firmware.md)).
+>
+> **Upstream sync:** moteus is deliberately relocated off the repo root so FlexNode is the top-level project, which means `git merge upstream/main` no longer applies cleanly. To pull upstream moteus fixes, `git fetch upstream` and copy/patch the changes into `moteus-r4-parent/` by hand. That manual sync is the accepted trade for owning the root.
 
-# License #
+## Status
 
-All files contained in this repository, unless otherwise noted, are
-available under an Apache 2.0 License:
-https://www.apache.org/licenses/LICENSE-2.0
+FlexNode is early. See [`docs/roadmap.md`](docs/roadmap.md) for the live checklist. In short: **PCBs fabricated, assembly and bring-up pending, firmware port underway.** Nothing here has been validated on hardware yet.
 
-# Trademark #
+## Credits & license
 
-mjbots Robotic Systems LLC owns and protects the "mjbots" and "moteus" trademarks in many jurisdictions.
+FlexNode derives from the **mjbots moteus r4.11** open-hardware controller by Josh Pieper ([mjbots/moteus](https://github.com/mjbots/moteus), Apache-2.0). The power stage, gate-driver topology, and STM32G4 core follow that design; the sensing, CAN-FD node architecture, and firmware deltas are FlexNode's.
 
-If you want to use these names in your project or product, please read the [Trademark Policy](https://mjbots.com/trademark-policy)
+This repository is licensed **Apache-2.0** (`LICENSE` at the root), inherited from moteus and covering FlexNode's additions unless a specific file states otherwise. moteus's original license is preserved in `moteus-r4-parent/LICENSE`. Retain the moteus attribution and the upstream link.
+
+Author: **Aditya Dutta** · Project: **CATBOT**
