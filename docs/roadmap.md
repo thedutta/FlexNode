@@ -1,6 +1,6 @@
 # FlexNode — Roadmap & Status
 
-_Last updated: 2026-07-15_
+_Last updated: 2026-07-21 (firmware compat layer implemented + builds; CAN layer designed; docs overhauled)_
 
 FlexNode v1.0 is **pre-bring-up**. Boards are fabricated; nothing below the "hardware" line has been validated on physical hardware yet.
 
@@ -18,16 +18,21 @@ FlexNode v1.0 is **pre-bring-up**. Boards are fabricated; nothing below the "har
 
 ## Firmware
 
-- [ ] Fork moteus; set `DetectMoteusFamily()` → `{family = 0, hw_version = 8}`
-- [ ] Pin remaps: PB11 → 5 V sense, PC6 → AS5047 CS, PC13 → servo/LED, PB10 → ToF INT
-- [ ] **Phase-order fix**: swap current-sense phase-0 ↔ phase-2 (A↔C) to match swapped PWM — see [firmware.md](firmware.md#phase-order)
-- [ ] Remove secondary-encoder references
+- [x] Fork moteus; `DetectMoteusFamily()` → hardcoded `{family = 0, hw_version = 8}`; autodetect + n1/c1/x1 pin maps deleted; builds green (417,600 B app, ~36 KiB free)
+- [x] AS5047 CS remap PB11 → PC6
+- [x] **Phase-order fix**: netlist-verified drive-side A/C re-pair (`pwm1`/`pwm3` pin swap; control core untouched) — see [firmware.md](firmware.md#phase-order); hardware validation at bring-up
+- [x] Remove secondary-encoder / strap-pin references (gone with the autodetect deletion; encoder-source config set per node at bring-up)
+- [ ] Remaining pin bring-up: PB11 → 5 V sense ADC, PC13 → servo/LED, PB10 → ToF INT
 - [ ] Encoder bring-up on new CS pin; FOC calibration
 - [ ] IMU (LSM6DS3TR-C) driver over non-blocking I²C
 - [ ] ToF (VL53L7CX) driver + INT handling
 - [ ] WS2812 status via SPI/timer-DMA
 - [ ] Servo output (timer PWM) + 5 V current-sense monitor
-- [ ] CAN-FD reporting/command schema for the added telemetry (IMU, ToF, aux current)
+- [x] CAN layer designed — register block 0x080–0x0FF, one-image + per-node config, poll-response two-lane cadence: see [can-layer.md](can-layer.md)
+- [ ] FlexNode register-block handlers (0x080–0x0FF) in `moteus_controller.cc` + `flexnode.*` config structs
+- [ ] `kAs5600L` I²C device type (programmable address) → Encoder-2 fast-lane path
+- [ ] Load-cell path (analog-amp vs HX711 decision) + on-node contact thresholding (reg 0x08B)
+- [ ] ToF init-blob streaming over the diagnostic tunnel (~84 KB, can't live in flash) + summary registers
 - [ ] Confirm `nBOOT0` option byte = boot-from-flash
 - [ ] First-article flash-write / config-persist validation
 
@@ -35,8 +40,8 @@ FlexNode v1.0 is **pre-bring-up**. Boards are fabricated; nothing below the "har
 
 - [ ] One node per actuator: 4× GIM8108-8 geared hips + leg 5010s
 - [ ] Daisy-chain bring-up; terminate only the two leaf nodes (120 Ω bridge)
-- [ ] Host (Jetson) ↔ node protocol; sensor-fusion pipeline
-- [ ] Multi-node time-sync / control-rate budgeting on the shared bus
+- [ ] Host (Jetson) ↔ node protocol; sensor-fusion pipeline — design in [can-layer.md](can-layer.md) (Phase A: fdcanusb @ 250–350 Hz; Phase B: core-board STM32G4 dual-chain bridge @ 400 Hz+)
+- [ ] Multi-node time-sync / control-rate budgeting on the shared bus — budget tables in [can-layer.md](can-layer.md); sync deferred until IMU fusion demands it
 
 ## Known open items
 

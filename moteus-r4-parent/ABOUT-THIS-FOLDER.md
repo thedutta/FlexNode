@@ -13,7 +13,7 @@ cd moteus-r4-parent
 tools/bazel build --config=target //:target
 ```
 
-FlexNode's firmware changes go into `fw/` here. The specific deltas from stock moteus (board-ID hardcode, pin remaps, the phase-order fix) are documented in [`../docs/firmware.md`](../docs/firmware.md).
+FlexNode's firmware changes go into `fw/` here — currently concentrated in `fw/moteus_hw.cc` (board-ID hardcode, autodetect deletion, AS5047-CS remap, and the drive-side phase-order fix). The full delta list and rationale live in [`../docs/firmware.md`](../docs/firmware.md).
 
 ## Upstream
 Upstream: https://github.com/mjbots/moteus (remote `upstream`). Because this tree was moved off the repo root, `git merge upstream/main` will not apply cleanly — pull upstream fixes by fetching `upstream` and copying/patching changes into this folder manually.

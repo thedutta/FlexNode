@@ -33,7 +33,7 @@ Status: **v1.0, as-ordered.** Not yet assembled or validated. Values below refle
 |---|---|---|---|
 | Motor bus | — | battery V+ | 10S-class, feeds FET bridge + DRV VM directly |
 | Aux buck | LGS5160C | V+ → 5 V | 65 V-rated sync buck, ~426 kHz, internal comp, hiccup SCP/OCP, EN tied to V+ |
-| Logic LDO | MCP1700 | 5 V → 3.3 V | MCU + sensor rail |
+| Logic LDO | ME6216A33M3G | 5 V → 3.3 V | MCU + sensor rail; MCP1700-footprint-compatible (SOT23-3: VSS/VOUT/VIN), 300 mA |
 | Buck output cap | 3× 10 µF (25 µF eff.) | — | transient-driven; feed-forward Cff optional/DNP |
 
 The buck EN is tied directly to V+ (no UVLO divider). Feedback: R15 (1 MΩ) / R17 (249 kΩ), RFREQ = 200 kΩ, PG pull-up R16 (100 kΩ). See the LGS5160C notes in the project datasheet folder for the full passive spec.
@@ -42,7 +42,7 @@ The buck EN is tied directly to V+ (no UVLO divider). Feedback: R15 (1 MΩ) / R1
 
 - **FETs:** 6× BSC016N06NS (60 V / 1.6 mΩ, TDSON-8). Chosen over moteus's TPH1R204PL for the higher voltage headroom at 10S; footprint changed to TDSON-8 to match.
 - **Gate drive:** DRV8353S, 3-PWM mode (low-side inputs tied to `MOTOR_HIZ`), 7.5 Ω gate resistors + BAT41 clamp diodes as in moteus. Gate-drive currents inherited from the r4.11 (`hw_version = 8`) register set — functional for the BSC016N06NS, not separately re-tuned.
-- **Current sense:** three in-line shunts → DRV current-sense amps (SOA/SOB/SOC) → RC filter → MCU ADC (PB0/PB1/PB2).
+- **Current sense:** three in-line shunts → DRV current-sense amps (SOA/SOB/SOC) → RC filter → MCU ADC (PB0/PB1/PB2). ⚠️ Schematic note: the CUR1/CUR3 net *labels* are swapped relative to moteus (label CUR3 = winding A, CUR1 = winding C) but the copper connectivity is stock — when bench-probing, trust pins, not labels.
 - **Copper:** 4-layer, 1 oz all layers. Validated against CATBOT's real phase currents (nominal ~2–5 A, transient peaks to ~25 A stall); the actuator thermally limits well before the board does, with comfortable FET margin. 1 oz also allows the tighter JLCPCB clearance that 2 oz would forbid.
 
 ## Rotor feedback
@@ -55,6 +55,7 @@ The buck EN is tied directly to V+ (no UVLO divider). Feedback: R15 (1 MΩ) / R1
 - **Daisy-chain**: connectors J3 (in) and J4 (out) share the differential pair, so nodes chain node-to-node on one bus.
 - **Termination**: a 120 Ω resistor selectable by a back-layer bridge pad — closed only on the two **leaf (end) nodes** of the chain; open (unterminated) on all interior nodes. Do **not** terminate every node.
 - **Protection**: SZNUP2105 dual TVS across the pair; common-mode choke on the transceiver side.
+- **Protocol, cadence, and bus budget**: see [can-layer.md](can-layer.md) — moteus register protocol extended with the FlexNode block (0x080–0x0FF), two-lane poll-response scheduling, and per-rate utilization math.
 
 ## Sensors (I²C1, PB8/PB9, 2 kΩ pull-ups)
 
@@ -82,9 +83,17 @@ The buck EN is tied directly to V+ (no UVLO divider). Feedback: R15 (1 MΩ) / R1
 | AS5047 CS | PB11 | **PC6** |
 | 5 V current sense | — | **PB11** |
 | Servo / LED | PC13 (2nd-enc CS) | **PC13** (servo/LED) |
-| Motor PWM phase A / C | PA0 / PA2 | **PA2 / PA0** (swapped — see firmware fix) |
+| Motor PWM phase A / C | PA0 / PA2 | **PA2 / PA0** (swapped in copper — compensated in firmware by a drive-side channel remap, see [firmware.md](firmware.md#phase-order)) |
 | Current sense phase A/B/C | PB0 / PB1 / PB2 | PB0 / PB1 / PB2 (unchanged copper) |
 | ToF INT | — | PB10 |
 | WS2812 data | LED (PF0) | PF0 |
 
-Because PC6 (a hardware-version strap) is repurposed, the on-board version detection is no longer valid — hence the firmware `hw_version` hardcode. See [`firmware.md`](firmware.md).
+Because PC6 (a hardware-version strap) is repurposed, the on-board version detection is no longer valid — hence the firmware `hw_version` hardcode (the autodetect code is deleted entirely). See [`firmware.md`](firmware.md).
+
+## Design verification
+
+Before fab release, the design went through independent verification passes:
+- **All 37 BOM line items** resolved by LCSC part number and checked against their manufacturer datasheets (pinouts, ratings, values) — this caught stale schematic annotations (e.g. cap voltage comments, inductor values) that did not reflect the actually-ordered parts. Rule established: the JLCPCB Part# column is authoritative; free-text comments are not.
+- **5 V power stage validated against the LGS5160C datasheet**: 400 kHz switching (RFREQ 200 k), 1 M/249 k feedback → 5.02 V, and the 10 µH inductor specifically sized so peak inductor current (~3.55 A at 3 A load) stays under the IC's 3.7 A high-side current limit.
+- **Drive/sense phase topology traced pin-by-pin** through both the FlexNode and moteus r4.11 schematics (see the phase-order analysis in [firmware.md](firmware.md#phase-order)).
+- Copper/thermal check against CATBOT's real phase-current profile (above).

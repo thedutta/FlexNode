@@ -1,77 +1,113 @@
 # FlexNode — Firmware
 
-FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteus). The FOC inner loop, FDCAN register protocol, and flash/bootloader layout are kept; only the pins FlexNode reuses are remapped, plus the added sensor/aux features. This document tracks the deltas from stock moteus.
+FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteus). The FOC inner loop, FDCAN register protocol, and flash/bootloader layout are kept byte-for-byte; FlexNode's deltas are concentrated in the hardware-description layer (`fw/moteus_hw.cc`) plus, later, the sensor/aux features. This document tracks the deltas from stock moteus.
 
-> **WIP.** The port is not yet complete or hardware-validated. Treat the code pointers below as the intended changes, to be confirmed on the first article.
+> **Pre-bring-up.** The compatibility layer below is implemented and **builds green** against the repo-pinned toolchain, but nothing has run on a physical board yet. First-article validation gates everything — see the checklist at the bottom.
 
-## Board identity — hardcode `{family = 0, hw_version = 8}`
+## Status at a glance
 
-FlexNode repurposes the strap pins moteus uses for hardware detection (PB11, PC6), so runtime family/version detection would misread. `DetectMoteusFamily()` (in `fw/moteus_hw.cc`) must return **`{family = 0, hw_version = 8}`**.
+| Delta | Status |
+|---|---|
+| Board identity hardcode `{family 0, hw_version 8}` | ✅ implemented, builds |
+| Runtime hardware autodetection | ✅ deleted (strap pins are repurposed) |
+| AS5047 CS remap PB11 → PC6 | ✅ implemented |
+| **Phase-order fix** (drive-side A/C re-pair) | ✅ implemented, **netlist-verified**; hardware validation pending |
+| n1/c1/x1 family pin maps | ✅ deleted (FlexNode is permanently family 0) |
+| PB11 5 V-sense ADC · PC13 servo/LED · PB10 ToF INT · WS2812 · IMU · load cell | ⏳ with peripheral bring-up — design in [can-layer.md](can-layer.md) |
+| FlexNode CAN register block (0x080–0x0FF) handlers | ⏳ designed ([can-layer.md](can-layer.md)), not implemented |
 
-Why `8` specifically:
-- `fw/drv8323.cc` selects DRV8323-vs-**DRV8353** register tables at runtime by `hw_version`: `>= 7` → DRV8353 (r4.8/r4.10/r4.11). FlexNode's gate driver is the DRV8353S, so it needs the `>= 7` path for correct `IDRIVEP/IDRIVEN/DEGLITCH/VDS_LVL`, plus `OCP_ACT` and `CAL_MODE`.
-- `hw_version = 8` also selects the correct r4.11 analog map: `vsense = PB_12_ALT0`, `msense = PA_8`, `vsense_adc_scale = 0.017947`.
+## Board identity — hardcoded `{family = 0, hw_version = 8}`
 
-`hw_version = 0` would program the DRV8353 with DRV8323 codes (wrong slew/OCP/current-sense calibration) and the wrong analog map — do not use it.
+FlexNode repurposes the strap pins moteus uses for hardware detection (PB10, PB11, PC6), so runtime family/version detection would misread the board — and would briefly drive those repurposed pins during boot. `DetectMoteusFamily()` in `fw/moteus_hw.cc` now returns **`{family = 0, hw_version = 8, hw_pins = 4}`** unconditionally; the strap-reading / gate-driver-probing autodetection and the moteus n1/c1/x1 (family 1/2/3) pin maps have been **deleted outright** (≈1.7 KiB flash back, and boot provably never touches PB10/PB11).
+
+Why `8` specifically — it is load-bearing twice:
+- `fw/drv8323.cc` selects DRV8323-vs-**DRV8353** register tables at runtime by `hw_version >= 7`. FlexNode's gate driver is the DRV8353S, so this routes it to the correct `IDRIVEP/IDRIVEN/DEGLITCH/VDS_LVL` tables plus the DRV8353-only `OCP_ACT` and `CAL_MODE` bits — with **zero edits to drv8323.cc**.
+- It selects the r4.11 analog map: `vsense = PB12`, `msense = PA8`, `vsense_adc_scale = 0.017947`.
 
 ## Pin remaps
 
-| Signal | moteus pin | FlexNode pin | Firmware touch-point |
+| Signal | moteus pin | FlexNode pin | Status |
 |---|---|---|---|
-| AS5047 chip-select | PB11 | **PC6** | encoder SPI CS config |
-| 5 V (servo) current sense | — | **PB11** | add ADC channel (aux monitor) |
-| Servo / LED output | PC13 | **PC13** | aux PWM/GPIO (was secondary-encoder CS) |
-| ToF interrupt | — | **PB10** | GPIO EXTI for VL53L7CX |
-| WS2812 data | PF0 | **PF0** | SPI/timer-DMA driver |
+| AS5047 chip-select | PB11 | **PC6** | ✅ done (`moteus_hw.cc`) |
+| Motor PWM phase A / C | PA0 / PA2 | **PA2 / PA0** | ✅ done — see phase-order fix below |
+| 5 V (servo) current sense | — | **PB11** | ⏳ ADC channel + reg 0x082 |
+| Servo / LED output | PC13 (2nd-enc CS) | **PC13** | ⏳ aux PWM/GPIO |
+| ToF interrupt | — | **PB10** | ⏳ EXTI for VL53L7CX |
+| WS2812 data | PF0 (debug LED) | **PF0** | ⏳ SPI/timer-DMA driver (stock firmware drives PF0 as a debug LED — harmless glitch pixels until then) |
 
-The secondary encoder is omitted; remove/disable its references.
+The moteus secondary encoder is omitted; its strap/CS uses are gone with the autodetect deletion, and the encoder-source config is set per node at bring-up.
 
-## <a name="phase-order"></a>Phase-order fix (must-do)
+## <a name="phase-order"></a>Phase-order fix (implemented)
 
-On the FlexNode PCB the **motor PWM phase A/C outputs are swapped** relative to moteus, but the **current-sense wiring is identical to moteus** (only the schematic net *labels* were renamed). Verified from the v1.0 netlist:
+**Verified pin-by-pin against both schematic PDFs (2026-07-21).** The FlexNode v1.0 copper swaps the A/C motor PWM outputs relative to moteus, while current-sense connectivity is stock:
 
-| | Phase A drive | Phase A sense | Phase C drive | Phase C sense |
-|---|---|---|---|---|
-| moteus | PA0 → INHA | SOA → PB0 | PA2 → INHC | SOC → PB2 |
-| FlexNode | **PA2** → INHA | SOA → PB0 | **PA0** → INHC | SOC → PB2 |
+| Physical connection | moteus r4.11 | FlexNode v1.0 |
+|---|---|---|
+| PA0 → | MOTOR1 → INHA (winding A) | **MOTOR3 → INHC (winding C)** |
+| PA1 → | MOTOR2 → INHB | MOTOR2 → INHB |
+| PA2 → | MOTOR3 → INHC (winding C) | **MOTOR1 → INHA (winding A)** |
+| PB0 ← | CUR1 ← SOA (winding A) | CUR3 ← SOA (winding A) — *same copper* |
+| PB1 ← | CUR2 ← SOB | CUR2 ← SOB |
+| PB2 ← | CUR3 ← SOC (winding C) | CUR1 ← SOC (winding C) — *same copper* |
 
-Stock moteus pairs the PWM channel on PA0 with the current-sense ADC on PB0 as the *same* phase. On FlexNode that pairing drives physical phase **C** while sensing physical phase **A** — the current loop would close on the wrong winding (not a direction reversal; calibration can't fix it).
+Only the sense-side net *labels* (CUR1↔CUR3) were renamed in the schematic; connectivity is stock. ⚠️ **Bench-probing note: trust pins, not labels** — the net the FlexNode schematic calls `CUR3` is winding A and appears in firmware telemetry as `cur1_A`.
 
-**Fix (firmware, no respin):** restore drive/sense consistency by swapping the A↔C assignment on **one** side only —
-- swap the current-sense channel assignment so the ADC on **PB0 is treated as phase C** and **PB2 as phase A** (phase-0 ↔ phase-2), **or**
-- swap the two PWM channel-to-phase assignments (drive phase A on PA2's channel, phase C on PA0's).
+Unfixed, stock firmware would pair PA0's PWM channel (physically driving winding **C**) with PB0's ADC (physically sensing winding **A**) as one logical phase — the current loop closes on the wrong winding. That is a topology error: no calibration, offset, or sign flip can repair it, and driving a motor that way risks the FETs.
 
-Either re-pairs drive-C with sense-C. Do exactly one. Confirm against the ECAD before flashing (PA0 → INHC? PB0 ← SOA?).
+**The fix (implemented in `fw/moteus_hw.cc`, family-0 branch):**
+
+```cpp
+result.pwm1 = PA_2_ALT0;  // logical phase 1 drives PA2 -> INHA (winding A)
+result.pwm3 = PA_0_ALT0;  // logical phase 3 drives PA0 -> INHC (winding C)
+```
+
+Two lines on the **drive side only**. `ConfigurePwmTimer()`/`FindCcr()` resolve timer CCR registers from these pins generically, so:
+- `bldc_servo.cc` — the entire FOC/current-sense core — stays byte-for-byte stock;
+- the logical-phase→winding mapping becomes identical to a stock r4.11, so calibration behaves identically;
+- `motor.phase_invert` semantics survive (the alternative sense-side swap breaks silently if that flag is ever set — analyzed and rejected).
+
+Exactly **one** side is swapped; swapping both would cancel back to broken. Status: implemented, builds green, image size unchanged. **Hardware validation at bring-up: first spin on a current-limited supply, verify calibration converges and phase currents track their windings.**
 
 ## Real-time constraints
 
-The FOC current loop runs in a tens-of-kHz ISR. Added features must never block it:
-- **WS2812**: clock the 800 kHz stream via SPI-DMA or timer-DMA; don't bit-bang in the ISR path.
-- **I²C sensors (IMU/ToF)**: use moteus's non-blocking I²C (`fw/stm32_i2c.h`, the aux-port pattern); poll from the slow loop.
-- **Servo**: drive from a timer PWM channel (50 Hz), trivial cost.
+The FOC current loop runs in a tens-of-kHz ISR (timer ISR samples currents; PendSV runs the math). Added features must never block it:
+- **WS2812**: clock the 800 kHz stream via SPI-DMA or timer-DMA; never bit-bang in the ISR path.
+- **I²C sensors (IMU/ToF)**: use moteus's non-blocking I²C engine (`fw/stm32_i2c.h`, the aux-port pattern); poll from the slow loop.
+- **Servo**: timer PWM channel (50 Hz), trivial cost.
+- **CAN handlers**: register reads copy pre-computed status — no work in the ISR.
 
-## Flash budget
+## Flash budget (measured)
 
-Measured (moteus HEAD, fw 0x000105, repo-pinned Bazel in WSL Ubuntu-22.04):
+Built with the repo-pinned Bazel 7.4.1 (WSL Ubuntu-22.04), current FlexNode tree:
 
-- moteus application image ≈ **409.5 KiB** (`.text` 376 KiB + `.ccmram` init 30 KiB + `.data` 2.7 KiB), `0x8010000 → 0x8076610`.
-- On the **512 KB** part (G473CEU6 / G474CEU6): app window to config = 446 KiB → ~**35 KiB free**.
-- FlexNode's additions fit that headroom if written lean and reusing existing moteus primitives (FDCAN, `fw/pid.h`, `fw/stm32_spi.h`, non-blocking I²C).
-- ⚠️ 256 KB parts (`…CCU6`) **do not fit** (~2.2× over) — MCU must be a 512 KB UFQFPN48 (`…CEU6`) with the full 5-ADC performance-line analog. LQFP48 parts are **package-incompatible** (no PC4/PC6). See project notes.
+- Application image **417,600 B (407.8 KiB)** at `0x08010000` (+ 8.4 KiB CAN bootloader at `0x0800c000`, 472 B vectors at `0x08000000`).
+- App window to the config region (`0x0807f000`) = 444 KiB → **~36 KiB free** for FlexNode's additions.
+- The additions fit that headroom if written lean and reusing existing moteus primitives (FDCAN, `fw/pid.h`, `fw/stm32_spi.h`, non-blocking I²C). Biggest consumer avoided by design: the VL53L7CX's ~84 KB init blob is **streamed from the host over the CAN diagnostic tunnel** instead of stored — see [can-layer.md](can-layer.md).
+- ⚠️ 256 KB parts (`…CCU6`) **do not fit** (~2.2× over) — the MCU must be a 512 KB UFQFPN48 (`…CEU6`). LQFP48 parts are package-incompatible (no PC4/PC6).
 
 ## Build & flash
 
 ```bash
-# in WSL (Ubuntu-22.04) — build from inside moteus-r4-parent/ (its WORKSPACE is the build root)
+# WSL (Ubuntu-22.04) — build from inside moteus-r4-parent/ (its WORKSPACE is the build root)
 cd moteus-r4-parent
 tools/bazel build --config=target //:target      # repo-pinned Bazel 7.4.1
-# flash via the moteus bootloader / SWD (P1 header: SWDIO=PA13, SWCLK=PA14, NRST)
+# flash via SWD (FLASH header: NRST·CLK·DIO·3V3·GND) or, once running, the moteus CAN bootloader
 ```
 
-FlexNode's firmware edits live in `moteus-r4-parent/fw/`.
+Windows/WSL notes (learned the hard way):
+- From Windows, invoke as `wsl.exe bash -c '…'` — a login shell (`bash -lc`) breaks in this environment.
+- **Line endings matter**: scripts executed in WSL (`tools/bazel`, `tools/workspace_status.sh`, `*.sh`) must be LF — a CRLF shebang yields `Unknown option: -` from python3. The repo `.gitattributes` pins `*.sh`, `*.py`, and `tools/bazel` to LF; don't fight it.
+- When piping bazel output, check `${PIPESTATUS[0]}` (or the `INFO: Build completed` line) — `tail`'s exit code will happily lie to you.
 
-First-article checklist before trusting flash writes: exercise the config-write path (`0x807f000`) with a power-cycle, and optionally confirm `DBANK = 1` via CubeProgrammer on the G473 die.
+## First-article checklist (before trusting the board)
+
+1. Power-on smoke test: 5 V and 3.3 V rails, no heating, quiescent current sane.
+2. Flash over SWD; confirm boot, CAN enumeration, telemetry.
+3. `nBOOT0` option byte = boot-from-flash (PB8 doubles as BOOT0).
+4. Exercise the config-write path (`0x0807f000`) with a power-cycle; optionally confirm `DBANK = 1` via CubeProgrammer.
+5. Encoder bring-up on PC6 CS; verify AS5047 angle telemetry.
+6. **Phase-order validation**: current-limited supply, `moteus_tool --calibrate`, confirm convergence and that commanded q-axis current produces torque without excess heating. Only then full current.
 
 ## Open firmware tasks
 
-See [`roadmap.md`](roadmap.md).
+See [`roadmap.md`](roadmap.md); the CAN-layer additions (register block 0x080–0x0FF, IMU/ToF/pixel/load-cell drivers, AS5600L device type) are specified in [`can-layer.md`](can-layer.md).
