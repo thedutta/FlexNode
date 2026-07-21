@@ -1,0 +1,9 @@
+# FlexNode is developed on Windows but built in WSL: scripts that
+# execute in Linux must keep LF endings, or shebangs break
+# ("/usr/bin/python3 -B\r").  core.autocrlf=true would otherwise smudge
+# them to CRLF on checkout.
+*.sh text eol=lf
+*.py text eol=lf
+moteus-r4-parent/tools/bazel text eol=lf
+moteus-r4-parent/tools/workspace text eol=lf
+*.gdb text eol=lf
