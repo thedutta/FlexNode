@@ -12,6 +12,7 @@ FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteu
 | Runtime hardware autodetection | ✅ deleted (strap pins are repurposed) |
 | AS5047 CS remap PB11 → PC6 | ✅ implemented |
 | **Phase-order fix** (drive-side A/C re-pair) | ✅ implemented, **netlist-verified**; hardware validation pending |
+| **Bus-voltage sense rescale** (as-built R30 = 1.2 k, not 4.7 k) | ✅ implemented — `vsense_adc_scale = 0.067944` (R30 value designer-confirmed); **DMM-verify at first boot** |
 | n1/c1/x1 family pin maps | ✅ deleted (FlexNode is permanently family 0) |
 | PB11 5 V-sense ADC · PC13 servo/LED · PB10 ToF INT · WS2812 · IMU · load cell | ⏳ with peripheral bring-up — design in [can-layer.md](can-layer.md) |
 | FlexNode CAN register block (0x080–0x0FF) handlers | ⏳ designed ([can-layer.md](can-layer.md)), not implemented |
@@ -68,6 +69,12 @@ Two lines on the **drive side only**. `ConfigurePwmTimer()`/`FindCcr()` resolve 
 
 Exactly **one** side is swapped; swapping both would cancel back to broken. Status: implemented, builds green, image size unchanged. **Hardware validation at bring-up: first spin on a current-limited supply, verify calibration converges and phase currents track their windings.**
 
+## Bus-voltage sense rescale (as-built R30 deviation)
+
+v1.0 boards were assembled with **R30 (the VBAT_SENSE divider bottom leg) on the 1.2 kΩ BOM line instead of the intended 4.7 kΩ** — a late part-selection error (v1.0 consolidated all nominal-1 k resistors onto one 1.2 kΩ 1 % line to minimize BOM count, and R30 was swept in; value designer-confirmed) found in the pre-power-on design review. Left unaddressed, the bus would read ~4× low, every commanded phase voltage would be applied ~3.8× too large (calibration included), and the overvoltage/flux-brake protections could never trigger. **Fixed in software**: `vsense_adc_scale` in `fw/moteus_hw.cc` now encodes the as-built 100 k / 1.2 k ratio (`0.067943`; stock r4.11 = `0.017947`).
+
+Consequences of the coarser scale (68 mV/LSB vs 18 mV/LSB): negligible for control — bus voltage is a filtered, slowly-varying scaling input, so the duty-conversion error is ~0.2 % worst-case; the dominant error is resistor tolerance (±1.3 %), which existed either way. **Mandatory bench check: compare `bus_V` telemetry against a DMM at first boot and trim the constant if they disagree.** At CATBOT's 8S operating point, also set `servo.max_voltage ≈ 38 V` so the flux brake engages near 35 V (the 46 V default puts it at 43 V — unreachable on 8S, so regen would otherwise pump the bus unclamped).
+
 ## Real-time constraints
 
 The FOC current loop runs in a tens-of-kHz ISR (timer ISR samples currents; PendSV runs the math). Added features must never block it:
@@ -103,10 +110,12 @@ Windows/WSL notes (learned the hard way):
 
 1. Power-on smoke test: 5 V and 3.3 V rails, no heating, quiescent current sane.
 2. Flash over SWD; confirm boot, CAN enumeration, telemetry.
-3. `nBOOT0` option byte = boot-from-flash (PB8 doubles as BOOT0).
-4. Exercise the config-write path (`0x0807f000`) with a power-cycle; optionally confirm `DBANK = 1` via CubeProgrammer.
-5. Encoder bring-up on PC6 CS; verify AS5047 angle telemetry.
-6. **Phase-order validation**: current-limited supply, `moteus_tool --calibrate`, confirm convergence and that commanded q-axis current produces torque without excess heating. Only then full current.
+3. **`bus_V` telemetry vs DMM** — must agree within ~0.5 V (validates the as-built R30 rescale; trim `vsense_adc_scale` if not).
+4. `nBOOT0` option byte = boot-from-flash (PB8 doubles as BOOT0).
+5. Exercise the config-write path (`0x0807f000`) with a power-cycle; optionally confirm `DBANK = 1` via CubeProgrammer.
+6. Encoder bring-up on PC6 CS; verify AS5047 angle telemetry.
+7. Bring-up config: `servo.max_current_A` ≈ 25–30 A (default 100 A is r4.11 legacy), `servo.vds_lvl_mv` toward 100–200 mV, `servo.max_voltage` ≈ 38 V for 8S.
+8. **Phase-order validation**: current-limited supply, `moteus_tool --calibrate`, confirm convergence and that commanded q-axis current produces torque without excess heating. Only then full current.
 
 ## Open firmware tasks
 

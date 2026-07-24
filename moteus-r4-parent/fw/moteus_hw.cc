@@ -85,8 +85,21 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
          hv >= 5 ? PA_8 :
          unsupported());
 
+    // === FlexNode vsense rescale (as-built divider deviation) ===
+    // The bus-voltage divider was intended as R29 100k / R30 4.7k
+    // (73.5 V full-scale, the stock r4.11 0.017947 scale), but v1.0
+    // consolidated every nominal-1k resistor onto the 1.2 k 1% BOM
+    // line (C138040) -- R30 included (value confirmed by the
+    // designer).  Rather than rework every board, the firmware
+    // constant encodes the as-built ratio:
+    //   3.3 V * (100k + 1.2k) / 1.2k / 4096 = 0.067944 V/count
+    //   (278.3 V full-scale, 68 mV/LSB -- negligible for control).
+    // A 0.01 uF filter cap parallels R30; it does not affect the DC
+    // ratio.  MANDATORY bench check at first boot: compare bus_V
+    // telemetry against a DMM and trim this constant if they disagree
+    // (1% resistors => expect agreement within ~1.5%).
     result.vsense_adc_scale =
-        (hv <= 5 ? 0.00884f : 0.017947f);
+        (hv <= 5 ? 0.00884f : 0.067944f);  // FlexNode as-built (stock r4.11: 0.017947f)
 
     result.drv8323_enable = PA_3;
     result.drv8323_hiz = PB_7;
