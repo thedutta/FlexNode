@@ -1,6 +1,6 @@
 # FlexNode — Distributed-Compute CAN Layer
 
-_Design doc, 2026-07-21. Status: **spec** — no firmware implements the FlexNode register block yet. Companion to [firmware.md](firmware.md) and [roadmap.md](roadmap.md)._
+_Design doc, 2026-07-21; status 2026-09-06: **partially implemented** — 0x080/0x081, IMU 0x098–0x09F, pixel 0x0B0–0x0B4 and 0x0FF are in firmware (see [firmware.md](firmware.md)), unverified over CAN. Companion to [firmware.md](firmware.md) and [roadmap.md](roadmap.md)._
 
 CATBOT is a Jetson host plus up to 13 FlexNodes on CAN-FD. Every node closes its own FOC loop locally (15–30 kHz); the bus carries **commands down, telemetry up** at the gait-control rate. Beyond motor control, FlexNodes host peripherals — external RC servos (head / limb yaw / spine), AS5600L joint encoders, load cells (foot contact), NeoPixels, an on-board IMU (LSM6DS3TR-C), ToF (VL53L7CX), and 5 V rail current sense. This document defines how all of that rides one protocol.
 
@@ -77,7 +77,7 @@ Upstream moteus uses ≤ 0x07f for realtime registers and 0x100–0x158 for info
 
 | Reg | Name | R/W | Notes |
 |---|---|---|---|
-| 0x080 | **Capabilities bitmask** | R | bit0 load cell, bit1 AS5600L, bit2 IMU, bit3 ToF, bit4 NeoPixel, bit5 servo, bit6 5V-sense. Host autodiscovery. |
+| 0x080 | **Capabilities bitmask** | R | ✅ bit0 load cell, bit1 AS5600L, bit2 IMU (set when WHO_AM_I answers), bit3 ToF, bit4 NeoPixel, bit5 servo, bit6 5V-sense. Host autodiscovery. |
 | 0x081 | FlexNode status/fault bits | R | peripheral fault summary (I²C errors, servo overcurrent, ToF not-initialized, …) |
 | 0x082 | 5 V rail current | R | PB11 ADC, firmware zero-offset calibrated |
 | 0x083–0x087 | _reserved_ | | |
@@ -89,18 +89,18 @@ Upstream moteus uses ≤ 0x07f for realtime registers and 0x100–0x158 for info
 | 0x090 | AS5600L raw angle | R | primary angle path is Encoder 2 (§6) — this is the raw/aux view |
 | 0x091 | AS5600L magnet/AGC health | R | AGC + MD/ML/MH bits |
 | 0x092–0x097 | _reserved (2nd AS5600L slot)_ | | |
-| 0x098–0x09A | IMU accel X/Y/Z | R | int16, scale in doc constants; 6 consecutive regs ⇒ one 3-byte read subframe |
-| 0x09B–0x09D | IMU gyro X/Y/Z | R | |
-| 0x09E | IMU temperature | R | |
-| 0x09F | IMU status/nonce | R | increments per sample — staleness detection |
+| 0x098–0x09A | IMU accel X/Y/Z | R | ✅ g: int8 0.1, int16 0.001, int32 1e-5, float; 6 consecutive regs ⇒ one read subframe |
+| 0x09B–0x09D | IMU gyro X/Y/Z | R | ✅ dps: int8 1, int16 0.1, int32 0.001, float |
+| 0x09E | IMU temperature | R | ✅ °C (moteus temperature scaling) |
+| 0x09F | IMU status/nonce | R | ✅ increments per sample — staleness detection; 0 while IMU inactive |
 | 0x0A0 | ToF min distance | R | mm |
 | 0x0A1–0x0A4 | ToF quadrant min distances | R | 4 quadrants of the 8×8 grid |
 | 0x0A5 | ToF target count | R | |
 | 0x0A6 | ToF frame nonce | R | |
 | 0x0A7–0x0AF | _reserved_ | | full 8×8 frame streams over the **diagnostic tunnel**, not registers |
-| 0x0B0 | NeoPixel mode | R/W | 0 off · 1 solid · 2 breathe · 3 chase · 4 custom(tunnel) |
-| 0x0B1–0x0B3 | NeoPixel RGB | R/W | |
-| 0x0B4 | NeoPixel brightness | R/W | |
+| 0x0B0 | NeoPixel mode | R/W | ✅ 0 off · 1 solid (2 breathe · 3 chase · 4 custom(tunnel) reserved, currently treated as solid) |
+| 0x0B1–0x0B3 | NeoPixel RGB | R/W | ✅ master colour 0..255 (int16+ on the wire); live, un-persisted — `conf set led.*` clears |
+| 0x0B4 | NeoPixel brightness | R/W | ✅ 0..255 |
 | 0x0B5–0x0B7 | _reserved (2nd color / rate)_ | | |
 | 0x0B8 | Servo 1 angle command | R/W | calibrated degrees → pulse via `flexnode.servo.*` map; raw duty remains available at upstream aux-PWM regs 0x076–0x07f |
 | 0x0B9 | Servo 2 angle command | R/W | |
@@ -108,7 +108,7 @@ Upstream moteus uses ≤ 0x07f for realtime registers and 0x100–0x158 for info
 | 0x0BB | Servo fault/overcurrent status | R | pairs with 0x082 |
 | 0x0BC–0x0BF | _reserved_ | | |
 | 0x0C0–0x0FE | _reserved for future FlexNode use_ | | |
-| 0x0FF | FlexNode block version | R | starts at 1; bump on any layout change |
+| 0x0FF | FlexNode block version | R | ✅ = 1; bump on any layout change |
 
 **Config namespace** (`conf set flexnode.…`, persisted like all moteus config): per-peripheral enables (drive the caps bitmask), `loadcell.scale/threshold/invert`, `servo.N.pulse_min/pulse_max/angle_min/angle_max`, `pixel.count`, `imu.rate_hz`, `tof.enable`.
 
@@ -135,7 +135,7 @@ Upstream moteus uses ≤ 0x07f for realtime registers and 0x100–0x158 for info
 
 ## 7. Flash budget & open items
 
-~36 KiB free on the 512 KB CEU6 after the stock image ([firmware.md](firmware.md)). Register handlers + IMU + load-cell + NeoPixel + servo wrappers fit if written lean against existing primitives (non-blocking I²C engine, aux ADC, timer-DMA).
+~17 KiB free on the 512 KB CEU6 as of 2026-09-06, with the WS2812 driver, IMU and the register skeleton in ([firmware.md](firmware.md)). Load-cell, ToF-summary and servo wrappers must be written lean against existing primitives (aux I²C engine, aux ADC, aux PWM); the IMU tilt demo is the first thing to drop if space runs out.
 
 - ⚠️ **VL53L7CX requires an ~84 KB firmware blob uploaded to the sensor at every power-on — it cannot live in node flash.** Design answer: the **host streams the blob over the CAN diagnostic tunnel at boot**, the node forwards it to the sensor over I²C. Zero flash cost; the trade is that ToF only initializes when a host is present (acceptable — ToF is useless without the host anyway). Bench-validate tunnel throughput for an acceptable boot time before committing.
 - AS5600L enum + address extension (small, do with encoder bring-up).

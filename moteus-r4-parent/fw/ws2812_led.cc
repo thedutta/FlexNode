@@ -14,6 +14,8 @@
 
 #include "fw/ws2812_led.h"
 
+#include <cmath>
+
 #include "mbed.h"
 
 namespace moteus {
@@ -48,13 +50,15 @@ uint8_t Scale(uint8_t v, uint8_t brightness) {
 Ws2812Led::Ws2812Led(mjlib::micro::PersistentConfig* persistent_config,
                      mjlib::micro::TelemetryManager* telemetry_manager,
                      PinName pin,
-                     const BldcServo* servo)
-    : servo_(servo) {
+                     const BldcServo* servo,
+                     const aux::I2C::ImuStatus* imu)
+    : servo_(servo),
+      imu_(imu) {
   if (pin != NC) {
     pin_.emplace(pin, 0);
   }
   persistent_config->Register("led", &config_,
-                              [this]() { this->UpdateTiming(); });
+                              [this]() { this->ConfigUpdated(); });
   telemetry_manager->Register("led", &status_);
 
   // Make sure the DWT cycle counter is running (moteus.cc enables it
@@ -70,6 +74,87 @@ void Ws2812Led::UpdateTiming() {
   t0h_cycles_ = static_cast<uint32_t>(clk * kT0HNs / 1000000000ull);
   t1h_cycles_ = static_cast<uint32_t>(clk * kT1HNs / 1000000000ull);
   tbit_cycles_ = static_cast<uint32_t>(clk * kBitNs / 1000000000ull);
+}
+
+void Ws2812Led::ConfigUpdated() {
+  // A conf set led.* wins over stale live values from the bus.
+  mode_ = 1;
+  live_channel_[0] = live_channel_[1] = live_channel_[2] = -1;
+  live_brightness_ = -1;
+  UpdateTiming();
+}
+
+void Ws2812Led::SetMode(int32_t mode) {
+  mode_ = (mode <= 0) ? 0 : 1;   // 2 breathe / 3 chase: reserved, treated as solid
+}
+
+void Ws2812Led::SetMasterChannel(int channel, int32_t v) {
+  if (channel < 0 || channel > 2) { return; }
+  live_channel_[channel] = Clamp8(v);
+}
+
+void Ws2812Led::SetBrightness(int32_t v) {
+  live_brightness_ = Clamp8(v);
+}
+
+int32_t Ws2812Led::master_channel(int channel) const {
+  if (channel < 0 || channel > 2) { return 0; }
+  if (live_channel_[channel] >= 0) { return live_channel_[channel]; }
+  const int32_t cfg[3] = {config_.master_r, config_.master_g, config_.master_b};
+  return Clamp8(cfg[channel]);
+}
+
+int32_t Ws2812Led::brightness() const {
+  return live_brightness_ >= 0 ? live_brightness_ : Clamp8(config_.brightness);
+}
+
+Ws2812Led::Rgb Ws2812Led::ImuDemoPixel() const {
+  if (!imu_ || !imu_->active) {
+    // IMU missing: slow red blink.
+    return ((ms_ / 500) % 2) ? Rgb{120, 0, 0} : Rgb{0, 0, 0};
+  }
+  constexpr float kAccelG = 0.000122f;   // +/-4 g
+  constexpr float kGyroDps = 0.0175f;    // +/-500 dps
+  constexpr float kPi = 3.14159265f;
+
+  const float ax = imu_->ax * kAccelG;
+  const float ay = imu_->ay * kAccelG;
+  const float tilt = std::sqrt(ax * ax + ay * ay);        // 0 flat .. ~1 on edge
+  float hue = std::atan2(ay, ax) / (2.0f * kPi);          // -0.5 .. 0.5
+  if (hue < 0.0f) { hue += 1.0f; }
+  const float sat = std::min(1.0f, tilt * 1.5f);
+
+  const float gx = imu_->gx * kGyroDps;
+  const float gy = imu_->gy * kGyroDps;
+  const float gz = imu_->gz * kGyroDps;
+  const float rate = std::sqrt(gx * gx + gy * gy + gz * gz);
+  const float val = std::min(1.0f, 0.45f + rate / 400.0f);
+
+  // HSV -> RGB
+  const float h6 = hue * 6.0f;
+  const int sector = static_cast<int>(h6) % 6;
+  const float f = h6 - static_cast<float>(static_cast<int>(h6));
+  const float p = val * (1.0f - sat);
+  const float q = val * (1.0f - sat * f);
+  const float t = val * (1.0f - sat * (1.0f - f));
+  float r = 0.0f, g = 0.0f, b = 0.0f;
+  switch (sector) {
+    case 0: r = val; g = t; b = p; break;
+    case 1: r = q; g = val; b = p; break;
+    case 2: r = p; g = val; b = t; break;
+    case 3: r = p; g = q; b = val; break;
+    case 4: r = t; g = p; b = val; break;
+    default: r = val; g = p; b = q; break;
+  }
+  return Rgb{static_cast<uint8_t>(r * 255.0f),
+             static_cast<uint8_t>(g * 255.0f),
+             static_cast<uint8_t>(b * 255.0f)};
+}
+
+Ws2812Led::Rgb Ws2812Led::EffectiveMaster() const {
+  return Rgb{static_cast<uint8_t>(master_channel(0)),
+             static_cast<uint8_t>(master_channel(1)),
+             static_cast<uint8_t>(master_channel(2))};
 }
 
 void Ws2812Led::SetPixel(int index, uint8_t r, uint8_t g, uint8_t b) {
@@ -137,15 +222,15 @@ void Ws2812Led::PollMillisecond() {
       (config_.count < 0) ? 0 :
       (config_.count > kMaxPixels - 1) ? (kMaxPixels - 1) : config_.count;
   const int32_t pixels = 1 + count;
-  const Rgb master{Clamp8(config_.master_r),
-                   Clamp8(config_.master_g),
-                   Clamp8(config_.master_b)};
-  const uint8_t brightness = Clamp8(config_.brightness);
+  const Rgb master = EffectiveMaster();
+  const uint8_t brightness = static_cast<uint8_t>(this->brightness());
+  const Rgb off{0, 0, 0};
 
   Rgb want[kMaxPixels];
   for (int32_t i = 0; i < pixels; i++) {
-    want[i] = has_override_[i] ? override_[i] : master;
+    want[i] = (mode_ == 0) ? off : (has_override_[i] ? override_[i] : master);
   }
+  if (config_.imu_demo) { want[0] = ImuDemoPixel(); }
 
   int32_t fault_code = 0;
   if (config_.fault_override && servo_ &&
@@ -156,6 +241,7 @@ void Ws2812Led::PollMillisecond() {
   if (fault_code != schedule_code_) { RebuildFaultSchedule(fault_code); }
   if (fault_code != 0) { want[0] = FaultPixel(); }
 
+  status_.mode = mode_;
   status_.pixels = pixels;
   status_.fault_shown = fault_code;
   status_.p0_r = want[0].r;

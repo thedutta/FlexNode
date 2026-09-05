@@ -18,8 +18,9 @@ FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteu
 | **Phase-order fix** (drive-side A/C re-pair) | ✅ implemented, **netlist-verified**; hardware validation pending |
 | **Bus-voltage sense rescale** (as-built R30 = 1.2 k, not 4.7 k) | ✅ implemented — `vsense_adc_scale = 0.067944` (R30 value designer-confirmed); **DMM-verify at first boot** |
 | n1/c1/x1 family pin maps | ✅ deleted (FlexNode is permanently family 0) |
-| PB11 5 V-sense ADC · PC13 servo/LED · PB10 ToF INT · WS2812 · IMU · load cell | ⏳ with peripheral bring-up — design in [can-layer.md](can-layer.md) |
-| FlexNode CAN register block (0x080–0x0FF) handlers | ⏳ designed ([can-layer.md](can-layer.md)), not implemented |
+| **LSM6DS3TR-C IMU** on aux2 I²C (PB8/PB9), on by default | ✅ implemented, **bench-verified 2026-09-06** (tilt → LED hue demo) |
+| FlexNode CAN register block (0x080–0x0FF) handlers | 🟡 skeleton in `moteus_controller.cc`: 0x080/0x081, IMU 0x098–0x09F, pixel 0x0B0–0x0B4, 0x0FF — unverified over CAN (no adapter yet) |
+| PB11 5 V-sense ADC · PC13 servo/LED · PB10 ToF INT · load cell | ⏳ with peripheral bring-up — design in [can-layer.md](can-layer.md) |
 
 ## Board identity — hardcoded `{family = 0, hw_version = 8}`
 
@@ -83,7 +84,7 @@ Consequences of the coarser scale (68 mV/LSB vs 18 mV/LSB): negligible for contr
 
 The FOC current loop runs in a tens-of-kHz ISR (timer ISR samples currents; PendSV runs the math). Added features must never block it:
 - **WS2812**: clock the 800 kHz stream via SPI-DMA or timer-DMA; never bit-bang in the ISR path.
-- **I²C sensors (IMU/ToF)**: use moteus's non-blocking I²C engine (`fw/stm32_i2c.h`, the aux-port pattern); poll from the slow loop.
+- **I²C sensors (IMU/ToF)**: ride moteus's aux-port I²C engine (`fw/aux_port.h`) as device types, so one owner drives I²C1 and the later AS5600L joint encoder shares the same bus. The IMU is done this way (below); ToF follows the same pattern.
 - **Servo**: timer PWM channel (50 Hz), trivial cost.
 - **CAN handlers**: register reads copy pre-computed status — no work in the ISR.
 
@@ -91,8 +92,8 @@ The FOC current loop runs in a tens-of-kHz ISR (timer ISR samples currents; Pend
 
 Built with the repo-pinned Bazel 7.4.1 (WSL Ubuntu-22.04), current FlexNode tree:
 
-- Application image **429,208 B (419.1 KiB)** at `0x08010000` (+ 8.4 KiB CAN bootloader at `0x0800c000`, 472 B vectors at `0x08000000`).
-- App window to the config region (`0x0807f000`) = 444 KiB → **~25 KiB free** for FlexNode's additions.
+- Application image **437,232 B (427.0 KiB)** at `0x08010000` (+ 8.4 KiB CAN bootloader at `0x0800c000`, 472 B vectors at `0x08000000`).
+- App window to the config region (`0x0807f000`) = 444 KiB → **~17 KiB free** for FlexNode's additions. ⚠️ Getting thin: the ToF summary registers and servo wrappers must be written lean; the IMU tilt demo (`led.imu_demo`, float HSV math) is a candidate to drop if space runs out.
 - The additions fit that headroom if written lean and reusing existing moteus primitives (FDCAN, `fw/pid.h`, `fw/stm32_spi.h`, non-blocking I²C). Biggest consumer avoided by design: the VL53L7CX's ~84 KB init blob is **streamed from the host over the CAN diagnostic tunnel** instead of stored — see [can-layer.md](can-layer.md).
 - ⚠️ 256 KB parts (`…CCU6`) **do not fit** (~2.2× over) — the MCU must be a 512 KB UFQFPN48 (`…CEU6`). LQFP48 parts are package-incompatible (no PC4/PC6).
 
@@ -112,6 +113,20 @@ Pixel 0 is the onboard LED; pixels 1..`led.count` are external "master control" 
 Fault code display: tens digit as amber blinks, gap, units digit as red blinks, long pause, repeat (a `0` units digit is one long red). Fault 35 (encoder) = 3 amber · 5 red. Telemetry group `led` reports frames sent, pixel count, the fault code being shown and pixel 0's colour.
 
 Live control today: `conf set led.master_r 255` etc. over the diagnostic channel (`moteus_tool --console`), `conf write` to persist. `Ws2812Led::SetPixel()` is the per-pixel hook for the CAN register block in [`can-layer.md`](can-layer.md).
+
+## IMU (LSM6DS3TR-C on I²C1)
+
+I²C1 on PB8/PB9 is, in moteus terms, the **aux2 port's I²C bus**, so the IMU is implemented as a new aux I²C device type rather than a second bus owner: `aux::I2C::DeviceConfig::kLsm6ds3` in `fw/aux_common.h`, driven by the existing non-blocking engine in `fw/aux_port.h`. On FlexNode it is **on by default**: `AuxPort` takes an `I2cDefault` (`kDefaultOnboardLsm6ds3` for aux2) that resolves `aux2.i2c.devices.0` from `kBoardDefault` to the IMU at address `0x6A`, 10 ms poll, and claims aux2 pins 0/1 as I²C. Set `aux2.i2c.devices.0.type 0` to disable it. Because PB8/PB9 are the sensor bus, aux2's stock debug-UART default is off on FlexNode.
+
+- Init: one 3-byte burst write CTRL1_XL/CTRL2_G/CTRL3_C = `0x48 / 0x44 / 0x44` (104 Hz ODR, ±4 g, ±500 dps, BDU + auto-increment), then a WHO_AM_I read (expects `0x6A`), then 14-byte bursts from `OUT_TEMP_L` (temp, gyro XYZ, accel XYZ) every poll.
+- Telemetry: `aux2.i2c.imu` — `active`, `whoami`, raw `ax ay az gx gy gz temp`, `nonce`, `error_count`. Raw LSBs; 0.122 mg/LSB, 17.5 mdps/LSB, 25 °C + temp/256.
+- Registers: 0x098–0x09A accel (g: int8 0.1, int16 0.001, int32 1e-5), 0x09B–0x09D gyro (dps: int8 1, int16 0.1, int32 0.001), 0x09E temperature, 0x09F nonce (0 while inactive). Capabilities 0x080 bit2 follows `active`; status 0x081 bit2 = configured but not answering.
+- Bench aid: `conf set led.imu_demo 1` paints pixel 0 from the IMU (hue = tilt direction, saturation = tilt, brightness rises with rotation rate; slow red blink = IMU silent). This is how the IMU was verified on 2026-09-06 with no CAN adapter on the bench.
+- Not yet: re-init after a bus fault (a wedged device stays `active = false` with `error_count` climbing until reboot), configurable full-scale/ODR, orientation calibration.
+
+## FlexNode register block (0x080–0x0FF)
+
+Implemented in `moteus_controller.cc` as additional `Register` enum values plus `Read`/`Write` cases, per [`can-layer.md`](can-layer.md) §5. Live so far: 0x080 capabilities (bit2 IMU, bit4 pixel), 0x081 status, 0x098–0x09F IMU, 0x0B0–0x0B4 pixel mode/RGB/brightness (live, un-persisted; a `conf set led.*` clears them), 0x0FF block version = 1. Values above 127 need int16 or wider on the wire. **Unverified over CAN** — no adapter on the bench yet; first CAN session should read 0x080 and 0x0FF, then write 0x0B1 = 255 and watch the LED go red.
 
 ## Build & flash
 

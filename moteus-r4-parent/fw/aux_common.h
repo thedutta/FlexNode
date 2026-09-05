@@ -371,10 +371,12 @@ struct I2C {
       kNone,
       kAs5048,
       kAs5600,
+      kLsm6ds3,       // FlexNode: LSM6DS3TR-C 6-axis IMU (accel + gyro + temp)
+      kBoardDefault,  // resolved by AuxPort to the board's onboard I2C device, else kNone
 
       kNumTypes,
     };
-    Type type = kNone;
+    Type type = kBoardDefault;
     uint8_t address = 0x40;
     int32_t poll_rate_us = 1000;
 
@@ -426,12 +428,46 @@ struct I2C {
     }
   };
 
+  // FlexNode: one LSM6DS3TR-C per port at most.  Raw LSBs as read;
+  // scaling lives in the register handlers (accel +/-4 g: 0.122 mg/LSB,
+  // gyro +/-500 dps: 17.5 mdps/LSB, temp: 25 C + raw/256).
+  struct ImuStatus {
+    bool active = false;      // WHO_AM_I matched and samples flowing
+    uint8_t whoami = 0;
+    int16_t ax = 0;
+    int16_t ay = 0;
+    int16_t az = 0;
+    int16_t gx = 0;
+    int16_t gy = 0;
+    int16_t gz = 0;
+    int16_t temp = 0;
+    uint8_t nonce = 0;
+    uint32_t error_count = 0;
+
+    template <typename Archive>
+    void Serialize(Archive* a) {
+      a->Visit(MJ_NVP(active));
+      a->Visit(MJ_NVP(whoami));
+      a->Visit(MJ_NVP(ax));
+      a->Visit(MJ_NVP(ay));
+      a->Visit(MJ_NVP(az));
+      a->Visit(MJ_NVP(gx));
+      a->Visit(MJ_NVP(gy));
+      a->Visit(MJ_NVP(gz));
+      a->Visit(MJ_NVP(temp));
+      a->Visit(MJ_NVP(nonce));
+      a->Visit(MJ_NVP(error_count));
+    }
+  };
+
   struct Status {
     std::array<DeviceStatus, 3> devices = { {} };
+    ImuStatus imu;
 
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(devices));
+      a->Visit(MJ_NVP(imu));
     }
   };
 };

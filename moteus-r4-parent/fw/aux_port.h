@@ -66,6 +66,14 @@ class AuxPort {
     kDefaultOnboardMa600,
   };
 
+  // FlexNode: which onboard I2C device, if any, this port's I2C bus
+  // carries by default (applied to i2c.devices.0 when it is left at
+  // kBoardDefault).
+  enum I2cDefault {
+    kDefaultI2cDisabled,
+    kDefaultOnboardLsm6ds3,
+  };
+
   enum UartDefault {
     kDefaultUartDisabled,
     kDefaultUartSerial,
@@ -82,6 +90,7 @@ class AuxPort {
           MillisecondTimer* timer,
           SpiDefault spi_default,
           UartDefault uart_default,
+          I2cDefault i2c_default,
           std::array<DMA_Channel_TypeDef*, 5> dma_channels)
       : pin_count_(std::max_element(
                        hw_config.pins.begin(), hw_config.pins.end(),
@@ -93,7 +102,8 @@ class AuxPort {
         hw_config_(hw_config),
         dma_channels_(dma_channels),
         spi_default_(spi_default),
-        uart_default_(uart_default) {
+        uart_default_(uart_default),
+        i2c_default_(i2c_default) {
     persistent_config->Register(aux_name, &config_,
                                 std::bind(&AuxPort::HandleConfigUpdate, this));
     telemetry_manager->Register(aux_name, &status_);
@@ -274,6 +284,11 @@ class AuxPort {
         state.pending = false;
         if (read_status == Stm32I2c::ReadStatus::kError) {
           status.error_count++;
+          if (config_.i2c.devices[i].type ==
+              aux::I2C::DeviceConfig::kLsm6ds3) {
+            status_.i2c.imu.error_count++;
+            status_.i2c.imu.active = false;
+          }
           break;
         }
 
@@ -643,6 +658,16 @@ class AuxPort {
   static constexpr uint8_t AS5600_REG_MAG_HIGH = 0x1B;
   static constexpr uint8_t AS5600_REG_MAG_LOW = 0x1C;
 
+  // LSM6DS3TR-C (FlexNode onboard IMU), SA0 tied low.
+  static constexpr uint8_t LSM6DS3_I2C_ADDRESS = 0x6A;
+  static constexpr uint8_t LSM6DS3_REG_WHO_AM_I = 0x0F;
+  static constexpr uint8_t LSM6DS3_WHO_AM_I_VALUE = 0x6A;
+  static constexpr uint8_t LSM6DS3_REG_CTRL1_XL = 0x10;   // CTRL2_G = 0x11, CTRL3_C = 0x12 follow
+  static constexpr uint8_t LSM6DS3_REG_OUT_TEMP_L = 0x20; // temp(2) gyro(6) accel(6) = 14 contiguous bytes
+  static constexpr uint8_t LSM6DS3_CTRL1_XL_104HZ_4G = 0x48;
+  static constexpr uint8_t LSM6DS3_CTRL2_G_104HZ_500DPS = 0x44;
+  static constexpr uint8_t LSM6DS3_CTRL3_C_BDU_IFINC = 0x44;
+
   void ISR_ParseI2c(size_t index) {
     const auto& config = config_.i2c.devices[index];
     auto& status = status_.i2c.devices[index];
@@ -657,12 +682,43 @@ class AuxPort {
         ISR_ParseAs5600(&status);
         break;
       }
+      case DC::kLsm6ds3: {
+        ISR_ParseLsm6ds3(&status);
+        break;
+      }
       case DC::kNone:
+      case DC::kBoardDefault:
       case DC::kNumTypes: {
         // Ignore.
         break;
       }
     }
+  }
+
+  void ISR_ParseLsm6ds3(aux::I2C::DeviceStatus* status) {
+    auto& imu = status_.i2c.imu;
+    if (imu_stage_ == 0) {
+      imu.whoami = encoder_raw_data_[0];
+      imu_stage_ = 1;
+      return;
+    }
+    const auto rd16 = [&](int i) {
+      return static_cast<int16_t>(
+          static_cast<uint16_t>(encoder_raw_data_[i]) |
+          (static_cast<uint16_t>(encoder_raw_data_[i + 1]) << 8));
+    };
+    imu.temp = rd16(0);
+    imu.gx = rd16(2);
+    imu.gy = rd16(4);
+    imu.gz = rd16(6);
+    imu.ax = rd16(8);
+    imu.ay = rd16(10);
+    imu.az = rd16(12);
+    imu.nonce += 1;
+    imu.active = i2c_startup_complete_ &&
+        (imu.whoami == LSM6DS3_WHO_AM_I_VALUE);
+    status->active = imu.active;
+    status->nonce = imu.nonce;
   }
 
   void ISR_ParseAs5048(aux::I2C::DeviceStatus* status) {
@@ -731,7 +787,20 @@ class AuxPort {
                                      encoder_raw_data_), 2));
             break;
           }
+          case DC::kLsm6ds3: {
+            // One burst write: CTRL1_XL, CTRL2_G, CTRL3_C.
+            encoder_raw_data_[0] = LSM6DS3_CTRL1_XL_104HZ_4G;
+            encoder_raw_data_[1] = LSM6DS3_CTRL2_G_104HZ_500DPS;
+            encoder_raw_data_[2] = LSM6DS3_CTRL3_C_BDU_IFINC;
+            i2c_->StartWriteMemory(
+                config.address, LSM6DS3_REG_CTRL1_XL,
+                std::string_view(reinterpret_cast<const char*>(
+                                     encoder_raw_data_), 3));
+            imu_stage_ = 0;
+            break;
+          }
           case DC::kNone:
+          case DC::kBoardDefault:
           case DC::kNumTypes: {
             MJ_ASSERT(false);
             break;
@@ -758,7 +827,16 @@ class AuxPort {
             StartI2cRead<3>(config.address, AS5600_REG_STATUS);
             break;
           }
+          case DC::kLsm6ds3: {
+            if (imu_stage_ == 0) {
+              StartI2cRead<1>(config.address, LSM6DS3_REG_WHO_AM_I);
+            } else {
+              StartI2cRead<14>(config.address, LSM6DS3_REG_OUT_TEMP_L);
+            }
+            break;
+          }
           case DC::kNone:
+          case DC::kBoardDefault:
           case DC::kNumTypes: {
             MJ_ASSERT(false);
             break;
@@ -943,6 +1021,30 @@ class AuxPort {
           SetDefaultUartPins();
           break;
         }
+      }
+    }
+
+    // Resolve I2C device board defaults.  On FlexNode the onboard
+    // LSM6DS3TR-C hangs off this port's bus, so device 0 becomes the IMU
+    // (and the two I2C-capable pins are claimed) unless the user has
+    // configured something else.
+    for (size_t i = 0; i < config_.i2c.devices.size(); i++) {
+      auto& device = config_.i2c.devices[i];
+      if (device.type != aux::I2C::DeviceConfig::kBoardDefault) { continue; }
+      if (i == 0 && i2c_default_ == kDefaultOnboardLsm6ds3) {
+        device.type = aux::I2C::DeviceConfig::kLsm6ds3;
+        device.address = LSM6DS3_I2C_ADDRESS;
+        device.poll_rate_us = 10000;
+        for (size_t p = 0; p < pin_count_; p++) {
+          if (config_.pins[p].mode != aux::Pin::Mode::kBoardDefault) { continue; }
+          for (const auto& hw_pin : hw_config_.pins) {
+            if (hw_pin.number == static_cast<int>(p) && hw_pin.i2c) {
+              config_.pins[p].mode = aux::Pin::Mode::kI2C;
+            }
+          }
+        }
+      } else {
+        device.type = aux::I2C::DeviceConfig::kNone;
       }
     }
 
@@ -1567,8 +1669,10 @@ class AuxPort {
   };
 
   std::array<I2cState, 3> i2c_state_;
-  uint8_t encoder_raw_data_[6] = {};
+  uint8_t encoder_raw_data_[14] = {};
   bool i2c_startup_complete_ = false;
+  // LSM6DS3: 0 = WHO_AM_I read pending, 1 = streaming samples.
+  uint8_t imu_stage_ = 0;
 
   static constexpr size_t kTunnelBufSize = 64;
 
@@ -1589,6 +1693,7 @@ class AuxPort {
   const std::array<DMA_Channel_TypeDef*, 5> dma_channels_;
   const SpiDefault spi_default_;
   const UartDefault uart_default_;
+  const I2cDefault i2c_default_;
 
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> start_sample_types_ = {};
   std::array<SampleType, static_cast<int>(SampleType::kLastEntry)> finish_sample_types_ = {};

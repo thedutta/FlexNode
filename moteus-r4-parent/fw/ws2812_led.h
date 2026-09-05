@@ -23,6 +23,7 @@
 #include "mjlib/micro/persistent_config.h"
 #include "mjlib/micro/telemetry_manager.h"
 
+#include "fw/aux_common.h"
 #include "fw/bldc_servo.h"
 #include "fw/stm32_digital_output.h"
 
@@ -70,6 +71,12 @@ class Ws2812Led {
     // If nonzero, pixel 0 blinks the fault code while the servo is faulted.
     int32_t fault_override = 1;
 
+    // Bench aid: if nonzero, pixel 0 shows the IMU instead of the master
+    // colour - hue from the tilt direction, saturation from tilt
+    // magnitude, brightness rising with rotation rate.  Slow red blink if
+    // the IMU is not answering.  Fault override still wins.
+    int32_t imu_demo = 0;
+
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(count));
@@ -78,11 +85,13 @@ class Ws2812Led {
       a->Visit(MJ_NVP(master_g));
       a->Visit(MJ_NVP(master_b));
       a->Visit(MJ_NVP(fault_override));
+      a->Visit(MJ_NVP(imu_demo));
     }
   };
 
   struct Status {
     uint32_t frames = 0;        // frames transmitted since boot
+    int32_t mode = 1;           // 0 off, 1 solid
     int32_t pixels = 1;         // pixels per frame (1 + count)
     int32_t fault_shown = 0;    // fault code currently blinked on pixel 0 (0 = none)
     int32_t p0_r = 0;           // what pixel 0 is showing (before brightness)
@@ -92,6 +101,7 @@ class Ws2812Led {
     template <typename Archive>
     void Serialize(Archive* a) {
       a->Visit(MJ_NVP(frames));
+      a->Visit(MJ_NVP(mode));
       a->Visit(MJ_NVP(pixels));
       a->Visit(MJ_NVP(fault_shown));
       a->Visit(MJ_NVP(p0_r));
@@ -103,7 +113,8 @@ class Ws2812Led {
   Ws2812Led(mjlib::micro::PersistentConfig* persistent_config,
             mjlib::micro::TelemetryManager* telemetry_manager,
             PinName pin,
-            const BldcServo* servo);
+            const BldcServo* servo,
+            const aux::I2C::ImuStatus* imu);
 
   /// Call once per millisecond from the main loop.
   void PollMillisecond();
@@ -113,6 +124,16 @@ class Ws2812Led {
   /// fault override).  Out-of-range indices are ignored.
   void SetPixel(int index, uint8_t r, uint8_t g, uint8_t b);
   void ClearOverrides();
+
+  /// Live (non-persisted) control, used by the FlexNode CAN registers
+  /// 0x0b0-0x0b4.  These shadow the led.* config until the config is
+  /// next changed through conf set, which drops the live values.
+  void SetMode(int32_t mode);                       // 0 off, 1 solid
+  void SetMasterChannel(int channel, int32_t v);    // 0=r 1=g 2=b, 0..255
+  void SetBrightness(int32_t v);                    // 0..255
+  int32_t mode() const { return mode_; }
+  int32_t master_channel(int channel) const;
+  int32_t brightness() const;
 
   const Config& config() const { return config_; }
   const Status& status() const { return status_; }
@@ -127,6 +148,9 @@ class Ws2812Led {
   };
 
   void UpdateTiming();
+  void ConfigUpdated();
+  Rgb EffectiveMaster() const;
+  Rgb ImuDemoPixel() const;
   void RebuildFaultSchedule(int32_t code);
   Rgb FaultPixel();
   void Transmit();
@@ -136,6 +160,7 @@ class Ws2812Led {
   Config config_;
   Status status_;
   const BldcServo* const servo_;
+  const aux::I2C::ImuStatus* const imu_;
   std::optional<Stm32DigitalOutput> pin_;
 
   Rgb override_[kMaxPixels] = {};
@@ -143,6 +168,11 @@ class Ws2812Led {
   Rgb shown_[kMaxPixels] = {};       // last transmitted picture (pre-brightness)
   int32_t shown_count_ = -1;
   int32_t shown_brightness_ = -1;
+
+  // Live overrides from the CAN registers (-1 = follow config).
+  int32_t mode_ = 1;
+  int32_t live_channel_[3] = {-1, -1, -1};
+  int32_t live_brightness_ = -1;
 
   uint32_t ms_ = 0;
   uint32_t last_tx_ms_ = 0;

@@ -23,6 +23,7 @@
 #include "fw/motor_position.h"
 #include "fw/multi_transport_datagram_server.h"
 #include "fw/uart_fdcanusb_micro_server.h"
+#include "fw/ws2812_led.h"
 
 namespace micro = mjlib::micro;
 namespace multiplex = mjlib::multiplex;
@@ -44,6 +45,16 @@ namespace {
 // enumeration has new meaning.
 
 constexpr int kRegisterMapVersion = 5;
+
+// FlexNode block (0x080-0x0ff) layout version; bump on any layout change.
+constexpr int kFlexNodeBlockVersion = 1;
+// Capability bits for reg 0x080.
+constexpr int kFlexCapImu = 1 << 2;
+constexpr int kFlexCapPixel = 1 << 4;
+
+// LSM6DS3TR-C scaling at the fixed full-scales configured in aux_port.h.
+constexpr float kImuAccelGPerLsb = 0.000122f;   // +/-4 g
+constexpr float kImuGyroDpsPerLsb = 0.0175f;    // +/-500 dps
 
 template <typename T>
 Value IntMapping(T value, size_t type) {
@@ -337,6 +348,26 @@ enum class Register {
   kAux2Pwm4 = 0x07e,
   kAux2Pwm5 = 0x07f,
 
+  // === FlexNode register block 0x080-0x0ff (docs/can-layer.md section 5) ===
+  // Fixed offsets, identical on every node; unpopulated peripherals
+  // answer kUnknownRegister.  Values > 127 need int16 or wider.
+  kFlexNodeCapabilities = 0x080,     // R  bit0 loadcell bit1 AS5600L bit2 IMU bit3 ToF bit4 pixel bit5 servo bit6 5V-sense
+  kFlexNodeStatus = 0x081,           // R  peripheral fault summary
+  kFlexNodeImuAccelX = 0x098,        // R  g:   int8 0.1, int16 0.001, int32 1e-5, float
+  kFlexNodeImuAccelY = 0x099,
+  kFlexNodeImuAccelZ = 0x09a,
+  kFlexNodeImuGyroX = 0x09b,         // R  dps: int8 1, int16 0.1, int32 0.001, float
+  kFlexNodeImuGyroY = 0x09c,
+  kFlexNodeImuGyroZ = 0x09d,
+  kFlexNodeImuTemperature = 0x09e,   // R  C (ScaleTemperature)
+  kFlexNodeImuNonce = 0x09f,         // R  increments per sample; 0 while IMU inactive
+  kFlexNodePixelMode = 0x0b0,        // RW 0 off, 1 solid (2 breathe / 3 chase reserved)
+  kFlexNodePixelR = 0x0b1,           // RW master colour 0..255
+  kFlexNodePixelG = 0x0b2,
+  kFlexNodePixelB = 0x0b3,
+  kFlexNodePixelBrightness = 0x0b4,  // RW 0..255
+  kFlexNodeBlockVersion = 0x0ff,     // R  layout version, starts at 1
+
   kModelNumber = 0x100,
   kFirmwareVersion = 0x101,
   kRegisterMapVersion = 0x102,
@@ -490,6 +521,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    (g_measured_hw_family == 1 ||
                     g_measured_hw_family == 3) ?
                    AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
+                   AuxPort::kDefaultI2cDisabled,
                    {DMA1_Channel3, DMA1_Channel4, DMA1_Channel5, DMA1_Channel6, DMA1_Channel7}),
         aux2_port_("aux2", "ic_pz2", GetAux2HardwareConfig(),
                    &aux_adc_.aux_info[1],
@@ -497,9 +529,10 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
                    multiplex_protocol->MakeTunnel(3),
                    timer,
                    AuxPort::kNoDefaultSpi,
-                   (g_measured_hw_family == 0 ||
-                    g_measured_hw_family == 2) ?
-                   AuxPort::kDefaultUartSerial : AuxPort::kDefaultUartDisabled,
+                   // FlexNode: aux2's PB8/PB9 are the onboard I2C1 sensor
+                   // bus (IMU, ToF, J2), never a debug UART.
+                   AuxPort::kDefaultUartDisabled,
+                   AuxPort::kDefaultOnboardLsm6ds3,
                    {DMA1_Channel8, DMA2_Channel1, DMA2_Channel2, DMA2_Channel3, DMA2_Channel4}),
         motor_position_(persistent_config, telemetry_manager,
                         aux1_port_.status(),
@@ -541,6 +574,8 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
 
             return options;
           }()),
+        led_(persistent_config, telemetry_manager, g_hw_pins.ws2812, &bldc_,
+             &aux2_port_.status()->i2c.imu),
         clock_manager_(clock_manager),
         system_info_(system_info),
         firmware_(firmware),
@@ -583,6 +618,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
     drv8323_.PollMillisecond();
     bldc_.PollMillisecond();
     motor_position_.PollMillisecond();
+    led_.PollMillisecond();
   }
 
   void StartFrame() override {
@@ -776,6 +812,24 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
         return kSuccess;
       }
 
+      // === FlexNode block ===
+      case Register::kFlexNodePixelMode: {
+        led_.SetMode(ReadInt32Mapping(value));
+        return kSuccess;
+      }
+      case Register::kFlexNodePixelR:
+      case Register::kFlexNodePixelG:
+      case Register::kFlexNodePixelB: {
+        const int channel =
+            static_cast<int>(reg) - static_cast<int>(Register::kFlexNodePixelR);
+        led_.SetMasterChannel(channel, ReadInt32Mapping(value));
+        return kSuccess;
+      }
+      case Register::kFlexNodePixelBrightness: {
+        led_.SetBrightness(ReadInt32Mapping(value));
+        return kSuccess;
+      }
+
       case Register::kSetOutputNearest: {
         const float position = ReadPosition(value);
         bldc_.SetOutputPositionNearest(position);
@@ -874,7 +928,18 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kFirmwareVersion:
       case Register::kMultiplexId:
       case Register::kDriverFault1:
-      case Register::kDriverFault2: {
+      case Register::kDriverFault2:
+      case Register::kFlexNodeCapabilities:
+      case Register::kFlexNodeStatus:
+      case Register::kFlexNodeImuAccelX:
+      case Register::kFlexNodeImuAccelY:
+      case Register::kFlexNodeImuAccelZ:
+      case Register::kFlexNodeImuGyroX:
+      case Register::kFlexNodeImuGyroY:
+      case Register::kFlexNodeImuGyroZ:
+      case Register::kFlexNodeImuTemperature:
+      case Register::kFlexNodeImuNonce:
+      case Register::kFlexNodeBlockVersion: {
         // Not writeable
         return kNotWriteable;
       }
@@ -1253,6 +1318,63 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
       case Register::kUuidMask4: {
         break;
       }
+      // === FlexNode block ===
+      case Register::kFlexNodeCapabilities: {
+        // Bits turn on as drivers land and devices answer.
+        const auto& imu = bldc_.aux2().i2c.imu;
+        return IntMapping(kFlexCapPixel | (imu.active ? kFlexCapImu : 0), type);
+      }
+      case Register::kFlexNodeStatus: {
+        const auto& imu = bldc_.aux2().i2c.imu;
+        // bit2 = IMU configured but not answering
+        const int imu_fault = (!imu.active && imu.error_count > 0) ? (1 << 2) : 0;
+        return IntMapping(imu_fault, type);
+      }
+      case Register::kFlexNodeImuAccelX:
+      case Register::kFlexNodeImuAccelY:
+      case Register::kFlexNodeImuAccelZ: {
+        const auto& imu = bldc_.aux2().i2c.imu;
+        const int16_t raw[3] = {imu.ax, imu.ay, imu.az};
+        const int axis =
+            static_cast<int>(reg) - static_cast<int>(Register::kFlexNodeImuAccelX);
+        return ScaleMapping(raw[axis] * kImuAccelGPerLsb,
+                            0.1f, 0.001f, 0.00001f, type);
+      }
+      case Register::kFlexNodeImuGyroX:
+      case Register::kFlexNodeImuGyroY:
+      case Register::kFlexNodeImuGyroZ: {
+        const auto& imu = bldc_.aux2().i2c.imu;
+        const int16_t raw[3] = {imu.gx, imu.gy, imu.gz};
+        const int axis =
+            static_cast<int>(reg) - static_cast<int>(Register::kFlexNodeImuGyroX);
+        return ScaleMapping(raw[axis] * kImuGyroDpsPerLsb,
+                            1.0f, 0.1f, 0.001f, type);
+      }
+      case Register::kFlexNodeImuTemperature: {
+        const auto& imu = bldc_.aux2().i2c.imu;
+        return ScaleTemperature(25.0f + imu.temp / 256.0f, type);
+      }
+      case Register::kFlexNodeImuNonce: {
+        const auto& imu = bldc_.aux2().i2c.imu;
+        return IntMapping(imu.active ? imu.nonce : 0, type);
+      }
+      case Register::kFlexNodePixelMode: {
+        return IntMapping(led_.mode(), type);
+      }
+      case Register::kFlexNodePixelR:
+      case Register::kFlexNodePixelG:
+      case Register::kFlexNodePixelB: {
+        const int channel =
+            static_cast<int>(reg) - static_cast<int>(Register::kFlexNodePixelR);
+        return IntMapping(led_.master_channel(channel), type);
+      }
+      case Register::kFlexNodePixelBrightness: {
+        return IntMapping(led_.brightness(), type);
+      }
+      case Register::kFlexNodeBlockVersion: {
+        return IntMapping(kFlexNodeBlockVersion, type);
+      }
+
       case Register::kDriverFault1: {
         return IntMapping(drv8323_.status()->fsr1, type);
       }
@@ -1271,6 +1393,7 @@ class MoteusController::Impl : public multiplex::MicroServer::Server {
   MotorPosition motor_position_;
   Drv8323 drv8323_;
   BldcServo bldc_;
+  Ws2812Led led_;
   ClockManager* const clock_manager_;
   SystemInfo* const system_info_;
   FirmwareInfo* const firmware_;
