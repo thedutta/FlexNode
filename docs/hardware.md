@@ -1,6 +1,6 @@
 # FlexNode — Hardware
 
-Status: **v1.0, as-ordered.** Not yet assembled or validated. Values below reflect the schematic/BOM committed to fab.
+Status: **v1.0, first article assembled and booted 2026-09-06.** Power tree (5 V / 3.3 V) and MCU boot-from-flash validated; the encoder is not yet soldered and the power stage has not been energized. Values below reflect the schematic/BOM committed to fab — note the as-built R30 deviation in [firmware.md](firmware.md).
 
 ## Block diagram
 

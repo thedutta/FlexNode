@@ -2,7 +2,10 @@
 
 FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteus). The FOC inner loop, FDCAN register protocol, and flash/bootloader layout are kept byte-for-byte; FlexNode's deltas are concentrated in the hardware-description layer (`fw/moteus_hw.cc`) plus, later, the sensor/aux features. This document tracks the deltas from stock moteus.
 
-> **Pre-bring-up.** The compatibility layer below is implemented and **builds green** against the repo-pinned toolchain, but nothing has run on a physical board yet. First-article validation gates everything — see the checklist at the bottom.
+> **First article booted 2026-09-06.** A v1.0 board ran the FlexNode firmware for the first time: powered from a 13 V bench adapter (no motor, no encoder fitted), flashed over SWD with an ST-Link V2, steady soft-blue status LED, servo in stopped mode.
+>
+> **Validated:** power tree (5 V buck and 3.3 V logic rail stable), MCU boots from flash, SWD/flash toolchain, PF0 → WS2812B, moteus main loop running.
+> **Still pending:** CAN enumeration, `bus_V`-vs-DMM check (validates the as-built R30 rescale), encoder (not yet soldered), and anything that energizes the gate driver. Calibration and motor drive stay gated behind current-limited phase-order validation — see the checklist at the bottom.
 
 ## Status at a glance
 
@@ -88,8 +91,8 @@ The FOC current loop runs in a tens-of-kHz ISR (timer ISR samples currents; Pend
 
 Built with the repo-pinned Bazel 7.4.1 (WSL Ubuntu-22.04), current FlexNode tree:
 
-- Application image **417,600 B (407.8 KiB)** at `0x08010000` (+ 8.4 KiB CAN bootloader at `0x0800c000`, 472 B vectors at `0x08000000`).
-- App window to the config region (`0x0807f000`) = 444 KiB → **~36 KiB free** for FlexNode's additions.
+- Application image **429,208 B (419.1 KiB)** at `0x08010000` (+ 8.4 KiB CAN bootloader at `0x0800c000`, 472 B vectors at `0x08000000`).
+- App window to the config region (`0x0807f000`) = 444 KiB → **~25 KiB free** for FlexNode's additions.
 - The additions fit that headroom if written lean and reusing existing moteus primitives (FDCAN, `fw/pid.h`, `fw/stm32_spi.h`, non-blocking I²C). Biggest consumer avoided by design: the VL53L7CX's ~84 KB init blob is **streamed from the host over the CAN diagnostic tunnel** instead of stored — see [can-layer.md](can-layer.md).
 - ⚠️ 256 KB parts (`…CCU6`) **do not fit** (~2.2× over) — the MCU must be a 512 KB UFQFPN48 (`…CEU6`). LQFP48 parts are package-incompatible (no PC4/PC6).
 
@@ -126,14 +129,14 @@ Windows/WSL notes (learned the hard way):
 
 ## First-article checklist (before trusting the board)
 
-1. Power-on smoke test: 5 V and 3.3 V rails, no heating, quiescent current sane.
-2. Flash over SWD; confirm boot, CAN enumeration, telemetry.
-3. **`bus_V` telemetry vs DMM** — must agree within ~0.5 V (validates the as-built R30 rescale; trim `vsense_adc_scale` if not).
-4. `nBOOT0` option byte = boot-from-flash (PB8 doubles as BOOT0).
-5. Exercise the config-write path (`0x0807f000`) with a power-cycle; optionally confirm `DBANK = 1` via CubeProgrammer.
-6. Encoder bring-up on PC6 CS; verify AS5047 angle telemetry.
-7. Bring-up config: `servo.max_current_A` ≈ 25–30 A (default 100 A is r4.11 legacy), `servo.vds_lvl_mv` toward 100–200 mV, `servo.max_voltage` ≈ 38 V for 8S.
-8. **Phase-order validation**: current-limited supply, `moteus_tool --calibrate`, confirm convergence and that commanded q-axis current produces torque without excess heating. Only then full current.
+1. ✅ Power-on smoke test: 5 V and 3.3 V rails, no heating, quiescent current sane. — *done 2026-09-06, 13 V bench adapter, both rails stable.*
+2. 🟡 Flash over SWD; confirm boot, CAN enumeration, telemetry. — *SWD flash and boot done (ST-Link V2 + xPack OpenOCD; 512 KiB dual-bank G47x, IDCODE `0x20036469`); **CAN enumeration and telemetry still pending**.*
+3. ⏳ **`bus_V` telemetry vs DMM** — must agree within ~0.5 V (validates the as-built R30 rescale; trim `vsense_adc_scale` if not).
+4. ✅ `nBOOT0` option byte = boot-from-flash (PB8 doubles as BOOT0). — *done: `nSWBOOT0` cleared, so the I²C pull-up holding PB8 high no longer forces the bootloader.*
+5. ⏳ Exercise the config-write path (`0x0807f000`) with a power-cycle; optionally confirm `DBANK = 1` via CubeProgrammer.
+6. ⏳ Encoder bring-up on PC6 CS; verify AS5047 angle telemetry. — *encoder not yet soldered.*
+7. ⏳ Bring-up config: `servo.max_current_A` ≈ 25–30 A (default 100 A is r4.11 legacy), `servo.vds_lvl_mv` toward 100–200 mV, `servo.max_voltage` ≈ 38 V for 8S.
+8. ⏳ **Phase-order validation**: current-limited supply, `moteus_tool --calibrate`, confirm convergence and that commanded q-axis current produces torque without excess heating. Only then full current.
 
 ## Open firmware tasks
 

@@ -2,7 +2,7 @@
 
 **A distributed compute node for mobile robots — high-current FOC actuation and sensor fusion, all over CAN-FD.**
 
-> ⚠️ **Work in progress.** FlexNode v1.0 boards have been fabricated; hardware bring-up is next. The firmware compatibility layer is implemented and building; nothing has been validated on a physical board yet. Expect breaking changes until the first article is proven.
+> ⚠️ **Work in progress — first article booted 2026-09-06.** A v1.0 board powers up, boots from flash, and runs the FlexNode firmware (status LED live, servo in stopped mode). Still unvalidated: CAN enumeration, bus-voltage telemetry, the encoder (not yet fitted), and anything that energizes the gate driver. Expect breaking changes until the first article is fully proven.
 
 ---
 
@@ -115,7 +115,7 @@ FlexNode's files live at the repo root; the upstream **moteus r4** project this 
 
 ## Status
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the live checklist. In short: **PCBs fabricated · firmware compatibility layer implemented and building · CAN layer designed · assembly and bring-up next.** Nothing is hardware-validated yet; the first article gates everything.
+See [`docs/roadmap.md`](docs/roadmap.md) for the live checklist. In short: **first article assembled and booted (2026-09-06) · power tree, flash boot and status LED validated · CAN layer designed, not yet implemented · motor and encoder bring-up next.** Nothing on the drive side is hardware-validated yet; current-limited phase-order validation gates motor operation.
 
 ## Credits & license
 
