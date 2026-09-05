@@ -110,7 +110,12 @@ MoteusHwPins FindHardwarePins(FamilyAndVersion fv) {
     result.drv8323_sck = PA_5;
     result.drv8323_fault = PB_6;
 
-    result.debug_led1 = PF_0;
+    // FlexNode: PF0 carries the WS2812B data line (see fw/ws2812_led.h),
+    // so the stock active-low debug LED is disconnected (NC) rather than
+    // left toggling the pixel data pin.  PF1 (stock power LED) is
+    // unconnected on FlexNode; driving it is harmless.
+    result.debug_led1 = NC;
+    result.ws2812 = PF_0;
     result.power_led = PF_1;
 
     // We've picked these particular pins so that all 3 channels are

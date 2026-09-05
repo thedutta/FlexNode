@@ -142,6 +142,8 @@ MOTEUS_SOURCES = [
     "system_info.cc",
     "uuid.h",
     "uuid.cc",
+    "ws2812_led.h",
+    "ws2812_led.cc",
     "moteus.cc",
 ]
 

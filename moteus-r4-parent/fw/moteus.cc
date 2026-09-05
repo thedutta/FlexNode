@@ -35,6 +35,7 @@
 #include "fw/moteus_hw.h"
 #include "fw/system_info.h"
 #include "fw/uuid.h"
+#include "fw/ws2812_led.h"
 
 #if defined(TARGET_STM32G4)
 #include "fw/fdcan.h"
@@ -270,6 +271,11 @@ int main(void) {
       &pool, &command_manager, &telemetry_manager, &multiplex_protocol,
       moteus_controller.bldc_servo());
 
+  // FlexNode: WS2812B status / lighting chain on PF0 (config group
+  // "led", telemetry "led").  Pixel 0 shows the fault code when faulted.
+  Ws2812Led status_led(&persistent_config, &telemetry_manager,
+                       g_hw_pins.ws2812, moteus_controller.bldc_servo());
+
   GitInfo git_info;
   telemetry_manager.Register("git", &git_info);
 
@@ -366,6 +372,7 @@ int main(void) {
       system_info.PollMillisecond();
       moteus_controller.PollMillisecond();
       board_debug.PollMillisecond();
+      status_led.PollMillisecond();
       system_info.SetCanResetCount(multi_transport.can_reset_count());
       timer.AdvanceMsSinceBoot();
 

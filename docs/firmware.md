@@ -11,6 +11,7 @@ FlexNode's firmware is a fork of [mjbots/moteus](https://github.com/mjbots/moteu
 | Board identity hardcode `{family 0, hw_version 8}` | ✅ implemented, builds |
 | Runtime hardware autodetection | ✅ deleted (strap pins are repurposed) |
 | AS5047 CS remap PB11 → PC6 | ✅ implemented |
+| WS2812B status/lighting driver on PF0 (`led.*` config) | ✅ implemented (first light 2026-09-06) |
 | **Phase-order fix** (drive-side A/C re-pair) | ✅ implemented, **netlist-verified**; hardware validation pending |
 | **Bus-voltage sense rescale** (as-built R30 = 1.2 k, not 4.7 k) | ✅ implemented — `vsense_adc_scale = 0.067944` (R30 value designer-confirmed); **DMM-verify at first boot** |
 | n1/c1/x1 family pin maps | ✅ deleted (FlexNode is permanently family 0) |
@@ -34,7 +35,7 @@ Why `8` specifically — it is load-bearing twice:
 | 5 V (servo) current sense | — | **PB11** | ⏳ ADC channel + reg 0x082 |
 | Servo / LED output | PC13 (2nd-enc CS) | **PC13** | ⏳ aux PWM/GPIO |
 | ToF interrupt | — | **PB10** | ⏳ EXTI for VL53L7CX |
-| WS2812 data | PF0 (debug LED) | **PF0** | ⏳ SPI/timer-DMA driver (stock firmware drives PF0 as a debug LED — harmless glitch pixels until then) |
+| WS2812 data | PF0 (debug LED) | **PF0** | ✅ `fw/ws2812_led.{h,cc}` — DWT-timed bit-bang from the main loop, IRQs masked only per high pulse; stock debug LED set NC |
 
 The moteus secondary encoder is omitted; its strap/CS uses are gone with the autodetect deletion, and the encoder-source config is set per node at bring-up.
 
@@ -91,6 +92,23 @@ Built with the repo-pinned Bazel 7.4.1 (WSL Ubuntu-22.04), current FlexNode tree
 - App window to the config region (`0x0807f000`) = 444 KiB → **~36 KiB free** for FlexNode's additions.
 - The additions fit that headroom if written lean and reusing existing moteus primitives (FDCAN, `fw/pid.h`, `fw/stm32_spi.h`, non-blocking I²C). Biggest consumer avoided by design: the VL53L7CX's ~84 KB init blob is **streamed from the host over the CAN diagnostic tunnel** instead of stored — see [can-layer.md](can-layer.md).
 - ⚠️ 256 KB parts (`…CCU6`) **do not fit** (~2.2× over) — the MCU must be a 512 KB UFQFPN48 (`…CEU6`). LQFP48 parts are package-incompatible (no PC4/PC6).
+
+## Status / lighting LED (WS2812B on PF0)
+
+PF0 has no SPI-MOSI or usable timer alternate function on the G474 (its only timer AF is TIM1_CH3N, which is the motor PWM timer), so the WS2812 stream is bit-banged from the main loop in `fw/ws2812_led.cc` using the DWT cycle counter at the 170 MHz core clock. Interrupts are masked only for the *high* part of each bit (≤ ~0.85 µs), never across a frame, so the 30 kHz control ISR gains sub-microsecond jitter at most and can preempt during any low period (the WS2812B only resets after >50 µs low; the ISR is far shorter). Frames are sent only when the picture changes, plus a 1 Hz refresh, so static lighting costs nothing.
+
+Pixel 0 is the onboard LED; pixels 1..`led.count` are external "master control" lighting on the same data line.
+
+| config | default | meaning |
+|---|---|---|
+| `led.count` | 0 | external pixels after the onboard one (max 31) |
+| `led.brightness` | 64 | global 0–255 scale |
+| `led.master_r/g/b` | 0 / 80 / 255 | colour every pixel shows unless individually overridden |
+| `led.fault_override` | 1 | pixel 0 blinks the fault code while `servo_stats.mode == 1 (fault)` |
+
+Fault code display: tens digit as amber blinks, gap, units digit as red blinks, long pause, repeat (a `0` units digit is one long red). Fault 35 (encoder) = 3 amber · 5 red. Telemetry group `led` reports frames sent, pixel count, the fault code being shown and pixel 0's colour.
+
+Live control today: `conf set led.master_r 255` etc. over the diagnostic channel (`moteus_tool --console`), `conf write` to persist. `Ws2812Led::SetPixel()` is the per-pixel hook for the CAN register block in [`can-layer.md`](can-layer.md).
 
 ## Build & flash
 

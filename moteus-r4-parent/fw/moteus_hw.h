@@ -50,6 +50,7 @@ struct MoteusHwPins {
 
   PinName debug_led1 = NC;
   PinName power_led = NC;
+  PinName ws2812 = NC;      // FlexNode: WS2812B addressable status/lighting chain
 
   PinName current1 = NC;
   PinName current2 = NC;
