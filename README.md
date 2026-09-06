@@ -124,3 +124,7 @@ FlexNode derives from the **mjbots moteus r4.11** open-hardware controller by Jo
 This repository is licensed **Apache-2.0** (`LICENSE` at the root), inherited from moteus and covering FlexNode's additions unless a specific file states otherwise. moteus's original license is preserved in `moteus-r4-parent/LICENSE`. Retain the moteus attribution and the upstream link.
 
 Author: **Aditya Dutta** · Manipal Institute of Technology, Bengaluru · Project: **CATBOT**
+
+## Build notes
+
+Working notes for the firmware and bench (what is validated, the bench rules, how to build/flash/debug, and lessons learned) live in [`notes/`](notes/). Read [`notes/README.md`](notes/README.md) first. Bench tooling is in [`tools/bench/`](tools/bench/).

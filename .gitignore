@@ -10,3 +10,9 @@ Thumbs.db
 # local scratch
 *_dump.txt
 *.log
+
+# bench tooling outputs (tools/bench/, see notes/build-and-flash.md)
+tools/bench/out/
+tools/bench/ledtest/*.bin
+tools/bench/ledtest/*.elf
+tools/bench/ledtest/*.map
