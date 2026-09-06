@@ -17,6 +17,7 @@ Working notes for the FlexNode firmware and bench, kept so that each new session
 | [`can-layer-design.md`](can-layer-design.md) | Why the CAN layer is shaped the way it is — decisions and the reasoning behind them |
 | [`flash-findings.md`](flash-findings.md) | Where the flash actually went, measured. Overturns an earlier assumption |
 | [`open-questions.md`](open-questions.md) | Decisions still pending: CAN adapter, encoder, head-gimbal topology, node count |
+| [`../reports/`](../reports/) | Dated standing reports for Aditya; first: [`2026-09-07-firmware-flash-optimisation.md`](../reports/2026-09-07-firmware-flash-optimisation.md) — the flash decision document, written to be read once |
 
 Conventions:
 - Dates are absolute (YYYY-MM-DD). "Today" rots.
