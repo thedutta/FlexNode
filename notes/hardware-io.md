@@ -128,6 +128,40 @@ Firmware-side availability confirmed 2026-09-07 02:40 IST; **pad breakout on the
 in [`../docs/can-layer.md`](../docs/can-layer.md) §9.2. Nothing should be committed to a v1.1
 board revision until TIM1 availability and the PB13/14/15 breakout are confirmed on real hardware.
 
+## Possible bench unblock: moteus_tool over serial, no CAN adapter
+
+_Found 2026-09-07 03:05 IST while auditing removable drivers — the driver that looked most cuttable
+turned out to be the most useful thing on the bench._
+
+moteus has a **`kSerial` aux UART mode** (`aux_common.h:104`, "fdcanusb ASCII protocol for serial
+control") backed by a `UartFdcanusbMicroServer` (`aux_port.h:443,1404`). It speaks the **full
+multiplex register protocol over a plain 3.3 V UART** — same protocol as CAN, same registers, same
+`moteus_tool`.
+
+On family 0, **USART3 is on PB_8 / PB_9** (`fw/moteus_controller.cc:462-463`) — exactly the pins
+broken out on FlexNode's **J2 I2C port**. So a ~$2 USB-TTL adapter on J2 plausibly gives
+`moteus_tool` access **without an fdcanusb**.
+
+Unblocks most of what is gated on "no CAN adapter":
+- enumerate the node, read 0x080 (capabilities) and 0x0FF (block version)
+- read bus_V vs a DMM — **the R30 rescale has never been verified**
+- write 0x0B1 = 255 and watch the LED go red (pixel regs are on PF0, independent of this bus)
+- exercise `conf set` / `conf write` and the persistent-config page for the first time
+
+> Gotcha: **the IMU and ToF live on that same bus.** Serial mode and I2C are mutually exclusive —
+> while the port is a UART the IMU is unavailable. Fine for the list above; don't expect both.
+
+Check before relying on it:
+- **PB8 is also BOOT0.** nSWBOOT0 is already cleared so boot-from-flash is safe, but the pin is
+  doing triple duty (BOOT0 / I2C / UART) — verify idle levels.
+- **The site's connector list mentions a TX/RX header that docs/hardware.md does not.** If one
+  exists in copper, find which pins — family-0 aux1 has no USART, so it would be PB8/PB9 anyway.
+  Netlist question for Aditya.
+
+> Gotcha: `kSerial` / `UartFdcanusbMicroServer` (5,917 B) was on the flash cut list. **Do not cut
+> it** — it may be the only way to talk to a FlexNode until a CAN adapter exists. A neat
+> illustration of why "unused driver" is a claim to verify, not assume.
+
 ## I²C bus loading
 
 Everything shares one bus: IMU + ToF + every I²C encoder + a load-cell ADC + any expander. At

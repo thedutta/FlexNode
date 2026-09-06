@@ -40,8 +40,14 @@ Needs a decision before the aux-node connector work. docs/can-layer.md §9.1.
 NAU7802 (I2C, 24-bit) recommended over HX711 (2-wire bit-bang — needs two GPIOs v1.0 hasn't got
 to spare) and ADS1220 (SPI — contends with the pads in 2 above). Keeps everything on one bus.
 
-## 3. CAN adapter
-None on the bench. Everything after the LED and IMU is blind without one. First CAN session: `moteus_tool --info`, read 0x080 and 0x0FF, `bus_V` vs DMM, write 0x0B1=255 and watch the LED go red.
+## 3. CAN adapter — possible workaround found 2026-09-07 03:05 IST
+None on the bench. Everything after the LED and IMU is blind without one.
+
+**Possible unblock:** moteus's `kSerial` aux UART mode speaks the full register protocol over a
+3.3 V UART, and family-0 USART3 sits on PB8/PB9 — FlexNode's J2 I2C header. A ~$2 USB-TTL adapter
+may therefore give `moteus_tool` access with no fdcanusb. Costs the IMU while active (same pins).
+See notes/hardware-io.md. **Untested.** If it works it is the cheapest possible unblock and should
+happen before anything else. First CAN session: `moteus_tool --info`, read 0x080 and 0x0FF, `bus_V` vs DMM, write 0x0B1=255 and watch the LED go red.
 
 ## 4. Encoder
 AS5047 not soldered. Until it is: no calibration, no position. Encoder bring-up on PC6 is its own gate.
