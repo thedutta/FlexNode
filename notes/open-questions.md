@@ -19,22 +19,26 @@ Order: (1) drop 7 telemetry registrations ~32 kB, (2) re-measure, (3) nano.specs
 
 Consequence: profiles are no longer load-bearing for space. One image fits the whole v2 CAN layer.
 
-## 2. SimpleFOC driver topology — ANSWERED (2026-09-07), but blocked on hardware
-Aditya: the SimpleFOC driver is a **peripheral of a FlexNode**, with its own AS5600 for feedback
-— not its own CAN node. So no classic-CAN coexistence problem.
+## 2. SimpleFOC driver topology — ANSWERED (2026-09-07), still blocked on a netlist check
+Aditya: the SimpleFOC driver is a **peripheral of a FlexNode**, with its own AS5600 for feedback —
+not its own CAN node. So no classic-CAN coexistence problem. Shoulder nodes carry a GIM 8108-8
+**and** a Mini simultaneously, so it is an addition to the onboard FOC axis, not an alternative.
 
-> Gotcha: v1.0 silicon probably cannot honour that. A Mini needs 3 PWM + enable; FlexNode v1.0's
-> only aux output is PC13, which has **no timer** (family-0 aux table, fw/moteus_controller.cc:406).
-> Candidate path is TIM1_CH1N/2N/3N on the SPI2 pads (PB13/14/15) — TIM1 looks free because motor
-> PWM is on TIM2 (PA0/1/2). Unverified. Costs the SPI pads and needs a second commutation loop.
-> See docs/can-layer.md §9.2 for the three options; option 1 (head driver gets its own MCU and
-> becomes a CAN peer) is currently preferred.
+Candidate: **PB13/14/15 → TIM1_CH1N/CH2N/CH3N**, confirmed in the mbed G474 PeripheralPins table.
+**TIM1 is free.** Remaining blocker is purely a **netlist question: are those pads actually broken
+out on the v1.0 board?** Options and constraints in docs/can-layer.md §9.2 and notes/hardware-io.md;
+option 1 (head driver gets its own MCU and becomes a CAN peer) still preferred.
 
-## 2b. Servo count — one output, seven servos needed
-Same root cause. CATBOT has 7 DS3235/DS3230 servos; v1.0 has one software-timed pulse pin.
-**Recommendation: PCA9685 on the existing J2 I2C port.** 16 hardware PWM channels over wires that
-already exist, no respin, and PB11 still current-senses the whole 5V rail for stall detection.
-Needs a decision before the aux-node connector work. docs/can-layer.md §9.1.
+<!-- self: this section previously said "PC13 has no timer" and "motor PWM is on TIM2". Both were
+     wrong and are corrected in notes/hardware-io.md (2026-09-07 02:40 IST). Motor PWM is on TIM5;
+     PC13 has TIM1_CH1N and TIM8_CH4N. Don't reintroduce the old claims. -->
+
+## 2b. Servo count — CLOSED 2026-09-07
+~~Recommendation: PCA9685 on the J2 I2C port.~~ **Withdrawn.** The 7 servos hang off **7 different
+FlexNodes, never two on one** — spaced that way from the beginning. One pulse per node suffices, and
+per the correction in notes/hardware-io.md it can even be **hardware-timed via TIM8_CH4N** rather
+than software-timed. An I2C PWM expander remains available for a future node that needs more
+channels than v1.0 breaks out, but nothing needs it today.
 
 ## 2c. Load-cell ADC part
 NAU7802 (I2C, 24-bit) recommended over HX711 (2-wire bit-bang — needs two GPIOs v1.0 hasn't got

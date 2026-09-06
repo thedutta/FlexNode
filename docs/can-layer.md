@@ -90,7 +90,12 @@ A slot model inverts it: **the host discovers a list of typed channels and drive
 
 ### 3.3 Channel register frame
 
-Base `0x200`, stride `0x10`, slots 1–8 (`0x210`–`0x28F`; `0x200`–`0x20F` reserved for a future slot 0 alias). Every channel of every type has the same ten core registers:
+Base `0x200`, stride `0x10`. **Sixteen slots of address space are reserved** (`0x200`–`0x2FF`),
+even though v1.0 hardware can populate at most about eight — address space is free, and running out
+of it later would force exactly the kind of layout break §10 promises never to make. Slot 0 is
+reserved as a future alias for the onboard axis.
+
+Every channel of every type has the same ten core registers:
 
 | Offset | Name | R/W | Meaning |
 |---|---|---|---|
@@ -102,7 +107,7 @@ Base `0x200`, stride `0x10`, slots 1–8 (`0x210`–`0x28F`; `0x200`–`0x20F` r
 | `+0x5` | `cmd_b` | R/W | rate limit — °/s, rev/s |
 | `+0x6` | `cmd_c` | R/W | effort limit — current A, voltage, brightness |
 | `+0x7` | `meas_a` | R | measured primary — angle, distance, force |
-| `+0x8` | `meas_b` | R | measured rate |
+| `+0x8` | `meas_b` | R | **second loop-critical measurement** for this type — kept adjacent to `meas_a` so the fast lane can read both in a 2-register subframe |
 | `+0x9` | `meas_c` | R | measured effort — current, raw counts |
 | `+0xA` | `meas_d` | R | auxiliary — temperature, magnet AGC, signal quality |
 | `+0xB` | `nonce` | R | increments once per update; **staleness detection** |
@@ -112,6 +117,9 @@ Base `0x200`, stride `0x10`, slots 1–8 (`0x210`–`0x28F`; `0x200`–`0x20F` r
 
 - a complete channel command is **one write subframe**: 3× int16 at `+0x4`
 - a complete channel readback is **one read subframe**: 4× int16 at `+0x7`
+- a *fast-lane* readback is cheaper still: **2× int16 at `+0x7`** — 3 B request / 7 B reply against
+  4 B / 12 B for the full four. Per node per cycle that is often a whole DLC step (§5.2), which is
+  why every type puts its loop-critical pair in `meas_a`/`meas_b`
 
 So a node with two active channels adds roughly `2 × (3 + 3·2)` command bytes and `2 × (3 + 4·2)` reply bytes to its frame — about 18 and 22 bytes. That is affordable at gait rate; [§5](#5-cadence-and-bus-budget) does the arithmetic.
 
@@ -124,11 +132,17 @@ Only the interpretation changes; the frame does not.
 | `servo_rc` | angle ° | slew °/s | — | angle ° (from bound encoder) | °/s | 5 V current A | — |
 | `bldc_ext` | position rev | velocity rev/s | current limit A | position rev | velocity rev/s | current A | driver temp |
 | `enc_i2c` | — | — | — | angle ° | °/s | — | magnet AGC / health |
-| `loadcell` | — | — | — | force (scaled) | d/dt | raw counts | **contact flag** |
-| `imu` | — | — | — | — | — | — | temp — *see §4 note* |
+| `loadcell` | — | — | — | force (scaled) | **contact flag** | raw counts | d/dt |
+| `imu` | — | — | — | — | — | — | temp |
 | `tof` | — | — | — | min distance mm | — | target count | ambient |
 | `pixel` | mode | — | brightness | — | — | — | — |
 | `rail_5v` | — | — | — | current A | — | peak A | — |
+
+> **The IMU is a deliberate exception.** Six axes do not fit `meas_a`–`meas_d`, so the `imu`
+> channel carries only the descriptor rows (`type`, `caps`, `status`, `nonce`) and the data stays
+> in the well-known block at `0x098`–`0x09F`, where it is already implemented and already reads as
+> six consecutive registers in one subframe. The channel entry exists so the host can *discover*
+> the IMU uniformly; it is not the transport for it. Same applies to any future wide sensor.
 
 **Servo closed-loop is on-node.** `servo_rc` with a bound `enc_i2c` channel runs its own outer position loop against the measured angle, which is precisely the "offloading minor calculations to flexnode" the design calls for — the host writes a target angle at gait rate and the node handles slew limiting, the pulse train, and stall detection from the 5 V current. Binding is config (`flexnode.ch<N>.feedback_ch`), not protocol.
 
@@ -162,7 +176,7 @@ Previously-reserved registers now defined in the node header:
 | `0x082` | 5 V rail current | R | *retained* |
 | `0x083` | **profile id** | R | which build is flashed — see [§6](#6-profiles-build-time-roles) |
 | `0x084` | **build hash (low 16)** | R | host asserts the fleet is running the image it expects |
-| `0x085` | **populated channel count** | R | 0 → node has no channels; skip enumeration |
+| `0x085` | **highest populated slot** | R | *not* a count — slots may be sparse, so a count would make the host miss a populated slot above an empty one. 0 → no channels; skip enumeration |
 | `0x086` | **fleet role / master state** | R | see [§7](#7-host-loss-and-inter-node-autonomy) |
 | `0x087` | **host-loss state** | R | 0 nominal, 1 warning, 2 timed out, 3 deputy-commanded |
 | `0x088`–`0x0BF` | peripheral aliases | | *retained* — load cell, encoder, IMU, ToF, pixel, servo |
@@ -222,36 +236,60 @@ Unchanged in principle from v1, extended to channels:
 
 ### 5.2 Frame time
 
-CAN-FD, 11-bit id, BRS, 5 Mbit data: ≈ 30 µs of arbitration-rate fields + `(8·N + 43)` bits at 5 Mbit for an N-byte payload.
+CAN-FD, BRS, 5 Mbit data: ≈ 30 µs of arbitration-rate fields + `(8·N + 43)` bits at 5 Mbit for an
+N-byte payload — **plus two corrections an earlier revision of this section missed.**
 
-| Payload | Frame time |
-|---|---|
-| 16 B | ~64 µs |
-| 24 B | ~77 µs |
-| 32 B | ~90 µs |
-| 48 B | ~116 µs |
-| 64 B | ~141 µs |
+> **Correction, 2026-09-07.** The budget below was optimistic by 15–20 points. Two effects, both
+> verified in source:
+>
+> 1. **Payloads are DLC-quantised.** CAN-FD has no 33-byte frame — `fw/fdcan.cc:24 RoundUpDlc`
+>    rounds up to the next legal size, so **anything from 33 to 48 B costs a full 48 B** on the
+>    wire. A payload that grows by one byte past a step boundary costs a whole step.
+> 2. **Fast-lane command frames are 29-bit extended, not 11-bit.** The host sets `0x8000`
+>    (reply-requested) in the id (`lib/python/moteus/transport.py:344`), and the firmware sends any
+>    id ≥ 2048 as extended (`fw/fdcan.cc:323`). Replies from nodes with id ≥ 8 are extended too.
+>    That is **≈ +20 µs per frame** at 1 Mbit arbitration — paid on every frame, every cycle.
+>
+> **Both headline conclusions survive and are stronger than stated**, so the design does not change
+> — but plan against the corrected numbers, not the old ones.
+
+| Payload | Frame time (11-bit) | Frame time (29-bit) |
+|---|---|---|
+| 16 B | ~64 µs | ~84 µs |
+| 24 B | ~77 µs | ~97 µs |
+| 32 B | ~90 µs | ~110 µs |
+| 48 B | ~116 µs | ~136 µs |
+| 64 B | ~141 µs | ~161 µs |
 
 ### 5.3 Budget by configuration
 
-Cycle cost = Σ over nodes (command frame + reply frame) + one slow-lane pair.
+Cycle cost = Σ over nodes (command frame + reply frame) + one slow-lane pair, at extended-frame
+timing with DLC quantisation applied.
 
-| Configuration | Per-node payloads | Cycle | @ rate → load |
-|---|---|---|---|
-| 13 nodes, axis only | 16 B / 16 B | ~1.7 ms | 325 Hz → **55 %** ✓ |
-| 13 nodes, axis + 1 fast channel | 24 B / 24 B | ~2.0 ms | 325 Hz → **65 %** ✓ |
-| 13 nodes, axis + 2 fast channels | 32 B / 32 B | ~2.3 ms | 325 Hz → **75 %** ⚠ |
-| 13 nodes, axis + 2 fast channels | 32 B / 32 B | ~2.3 ms | 400 Hz → **92 %** ✗ |
-| 2 chains × 7, axis + 2 fast channels | 32 B / 32 B | ~1.3 ms | 400 Hz → **52 %** ✓ |
-| 2 chains × 7, axis + 2 fast channels | 32 B / 32 B | ~1.3 ms | 1 kHz → **130 %** ✗ |
-| 2 chains × 7, axis + 1 fast channel | 24 B / 24 B | ~1.1 ms | 800 Hz → **88 %** ⚠ |
+| Configuration | Corrected load | (old, wrong) |
+|---|---|---|
+| 13 nodes, axis only, 325 Hz | **~70 %** ⚠ | 55 % |
+| 13 nodes, axis + 1 fast channel, 325 Hz | **~84 %** ✗ | 65 % |
+| 13 nodes, axis + 2 fast channels, 325 Hz | **~97 %** ✗ | 75 % |
+| 2 chains × 7, axis + 2 fast channels, 400 Hz | ~65 % ⚠ | 52 % |
+| 2 chains × 7, axis + 2 fast channels, 1 kHz | ✗✗ | 130 % |
 
-**Rules that fall out of this table:**
+**Rules that fall out of this table — unchanged in direction, sharper in degree:**
 
-1. Keep steady-state load ≤ 65 %. The headroom absorbs error frames, retransmission, and the slow lane landing on a fat node.
-2. **Two fast channels per node is the practical ceiling on a single 13-node chain.** Budget them deliberately: foot contact and joint angle are worth it; IMU at gait rate usually is not (put it on the slow lane, or fast on only the two or three nodes feeding state estimation).
-3. **1 kHz is not reachable on one chain, and is marginal even on two.** The v1 doc's 400 Hz target is the right one. Revisit only if a locomotion policy demonstrably needs sub-millisecond torque transparency — and note the RC servos are 50–330 Hz devices regardless, and FOC is local at 30 kHz either way.
-4. Splitting front/rear (or left/right) buys nearly 2× and independently buys fault containment. It is the single highest-leverage topology decision.
+1. Keep steady-state load ≤ 65 %. Headroom absorbs error frames, retransmission, and the slow lane
+   landing on a fat node.
+2. **Two fast channels per node is the ceiling on a single 13-node chain** — and on the corrected
+   numbers even *one* fast channel is uncomfortable there. Budget them deliberately: foot contact
+   and joint angle earn their place; IMU at gait rate usually does not.
+3. **1 kHz is not reachable on one chain and is not reachable on two.** 400 Hz on two chains is the
+   real target. The RC servos are 50–330 Hz devices regardless, and FOC is local at 30 kHz either
+   way.
+4. **Splitting front/rear is no longer optional if more than the axis rides the fast lane.** It buys
+   ~2× and independently buys fault containment — the single highest-leverage topology decision, and
+   the corrected numbers make it close to mandatory.
+5. **Watch the DLC step boundaries.** Because 33 B and 48 B cost the same, there is a free byte
+   allowance up to each boundary and a cliff just past it. Design frames to land just under 16, 24,
+   32 or 48 B.
 
 ---
 
