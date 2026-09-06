@@ -1,144 +1,419 @@
-# FlexNode — Distributed-Compute CAN Layer
+# FlexNode — CAN Layer Architecture
 
-_Design doc, 2026-07-21; status 2026-09-06: **partially implemented** — 0x080/0x081, IMU 0x098–0x09F, pixel 0x0B0–0x0B4 and 0x0FF are in firmware (see [firmware.md](firmware.md)), unverified over CAN. Companion to [firmware.md](firmware.md) and [roadmap.md](roadmap.md)._
+_v2, 2026-09-07. Supersedes the v1 design of 2026-07-21 (the v1 register block 0x080–0x0FF is retained verbatim — see [§4](#4-the-node-block-0x0800x0ff-v1-retained)). Companion to [firmware.md](firmware.md), [hardware.md](hardware.md), [roadmap.md](roadmap.md)._
 
-CATBOT is a Jetson host plus up to 13 FlexNodes on CAN-FD. Every node closes its own FOC loop locally (15–30 kHz); the bus carries **commands down, telemetry up** at the gait-control rate. Beyond motor control, FlexNodes host peripherals — external RC servos (head / limb yaw / spine), AS5600L joint encoders, load cells (foot contact), NeoPixels, an on-board IMU (LSM6DS3TR-C), ToF (VL53L7CX), and 5 V rail current sense. This document defines how all of that rides one protocol.
+**Status:** design. Implemented today: node block 0x080/0x081, IMU 0x098–0x09F, pixel 0x0B0–0x0B4, version 0x0FF. Everything in [§3](#3-the-channel-model) and [§7](#7-host-loss-and-inter-node-autonomy) is unbuilt. **Nothing in this document has been exercised over a real CAN bus** — there is no adapter on the bench yet.
 
-## 1. Decision: extend the moteus register protocol, don't invent one
+---
 
-moteus already ships a register-based protocol over CAN-FD (1 Mbit arbitration / 5 Mbit data, ≤64 B payloads). Spec: `moteus-r4-parent/docs/protocol/can.md` + `registers.md`; reference parser: `lib/python/moteus/multiplex.py`.
+## 0. What this layer is for
 
-A frame is a concatenation of **subframes**, each a read/write/reply of N *consecutive* registers at int8/int16/int32/float resolution:
+FlexNode is a hardware fork of moteus with one purpose: make CATBOT buildable by making a *node* the unit of composition instead of a *motor controller*. A node is "one actuator plus whatever that joint needs to know about itself". The CAN layer is the enabler — it is what turns thirteen boards into one machine, and it is also the product's public API if FlexNode is ever sold.
+
+Two properties follow from that, and they drive every decision below:
+
+1. **The register map is a stable, versioned, public interface.** It must not change meaning between boards, builds, or firmware revisions. A host written against FlexNode block v2 must work against every node claiming v2, forever.
+2. **What a node *is* may vary; what a register *means* may not.** Nodes differ in populated hardware and compiled features. They never differ in semantics.
+
+### What changed since v1
+
+| | v1 (2026-07-21) | v2 (this document) | Why |
+|---|---|---|---|
+| Configuration | One image, thirteen configs | One image *per profile*, config within a profile | Aditya, 2026-09-07: hardware changes can't happen at runtime, so a reflash on hardware change is "fully acceptable". This is the release valve for the flash budget. |
+| Peripheral model | Fixed registers per peripheral kind | **Typed channel slots**, strided registers | Fixed registers don't survive "any accommodatable combination". Slots do, and they make the map sellable. |
+| SimpleFOC driver | Open question: peripheral or its own node? | **Peripheral of a node** | Answered 2026-09-07. See the hardware gap in [§9](#9-hardware-gaps-that-this-design-exposes) — v1.0 silicon may not be able to honour it. |
+| Host failure | Not addressed | [§7](#7-host-loss-and-inter-node-autonomy), three graded levels | "potentially have inter-flexnode comms too, if jetson goes dead and hangs" |
+| Unsolicited transmit | Never | Never, **except** a config-gated deputy in G2 | Scoped exception, not an abandoned invariant |
+
+### Scope note on node count
+
+The published CATBOT actuator list is 4× GIM8108-8 hips + 6× 5010 knees (BLDC, one FlexNode each) + 2 head gimbals on a SimpleFOC dual driver + 7 DS3235/DS3230 servos on node aux ports = 19 DoF but only **10 BLDC actuators**. The "thirteen nodes" figure elsewhere is therefore 10 actuator nodes + ~3 non-actuator nodes (servo/sensor duty). This document assumes 10 + 3 and sizes the bus for 13. **Flagged as unreconciled** — the split changes the profile mix in [§6](#6-profiles-build-time-roles), not the protocol.
+
+---
+
+## 1. Layering
+
+Keeping these four layers separate is what lets the top two change without breaking moteus tooling.
+
+| Layer | What it is | Ours? |
+|---|---|---|
+| **L0 Transport** | CAN-FD, 1 Mbit arbitration / 5 Mbit data. Frame id = `(source << 8) \| destination`; high bit of source = reply requested. `can.prefix` occupies the upper extended-id bits and namespaces a bus. **Destination `0x7f` is a broadcast every node accepts** (verified in `fw/moteus.cc:307` — filters 1 and 3 accept `prefix<<16 \| 0x7f` for both standard and extended frames). | stock |
+| **L1 Register protocol** | moteus multiplex subframes: read/write N *consecutive* registers at int8/int16/int32/float resolution. Register numbers are varuints, so anything ≤ 0x3FFF costs 2 bytes. | stock, untouched |
+| **L2 Channel model** | The FlexNode object model: one axis + typed channel slots, mapped onto register space. | **new, §3** |
+| **L3 Fleet** | Discovery, two-lane scheduling, time sync, host-loss autonomy. | **new, §5, §7** |
+
+**We do not invent a protocol.** L0 and L1 stay bit-for-bit stock moteus, which buys `moteus_tool`, `tview`, the CAN bootloader, and the Python library for free. FlexNode is entirely an L2/L3 addition living in unused register space. A stock moteus host talking to a FlexNode sees a working moteus controller; it simply never asks about the extra registers.
+
+---
+
+## 2. The object model
 
 ```
-host → node 1 (id 0x8001 = from 0x80|0, to 1, reply requested):
-  01 00 0a          write 1×int8  reg 0x000 (Mode) = 10 (position)
-  07 20 6000 2001 50ff   write 3×int16 regs 0x020.. (pos, vel, ff-torque)
-  14 04 00          read  4×int16 regs 0x000-0x003 (mode, pos, vel, torque)
-  13 0d             read  3×int8  regs 0x00d-0x00f (voltage, temp, fault)
-node 1 → host: one reply frame with the requested values.
+FlexNode
+├── Axis 0        onboard BLDC via DRV8353S      → registers 0x000–0x07F   (stock moteus, untouched)
+├── Node services identity, caps, health, fleet   → registers 0x080–0x0FF   (v1 block, retained)
+├── Channel 1..8  typed peripheral slots          → registers 0x200 + 0x10·n (new)
+└── Tunnel        bulk transfers (ToF blob, logs) → diagnostic stream channel
 ```
 
-**"Dedicated CATBOT packet" vs "flexible per-node layout" is a false dichotomy here.** The **register map is fixed** — one universal FlexNode block (§5) with identical semantics on every node ever built — while **each frame is composed per node**: the host queries only the registers a given node populates. A node without a load cell answers `kUnknownRegister`; the capabilities register (0x080) lets the host autodiscover the fleet at boot and build each node's query automatically.
+Axis 0 may be **absent** (a node with no motor is a legitimate configuration, and a cheap one — it drops the whole FOC stack). Channels are what the user's "actuator + x configuration" actually maps onto.
 
-**One firmware image, thirteen configs.** Node identity is *data*, not code: CAN id (`id.id`), aux pin modes, encoder sources, and the new `flexnode.*` keys all live in moteus persistent config (`conf set` / `conf write`). One `.elf` is flashed to all nodes (SWD or CAN bootloader); per-node behavior comes from config. No per-node builds.
+---
 
-**Strictly poll-response.** Stock moteus firmware never transmits unsolicited, and FlexNode keeps that: the bus master owns all timing, worst-case latency is schedulable, and there are no arbitration storms. "Report at intervals" is implemented by the *master's* schedule (§3), not by nodes free-running.
+## 3. The channel model
 
-## 2. Topology & host phases
+### 3.1 Why slots
 
-Single-master daisy chain(s); terminate only the two physical chain ends (120 Ω), per [roadmap.md](roadmap.md).
+The v1 map hard-assigned registers per peripheral kind: load cell here, servo there, encoder over there. That works for a fixed robot and fails for a product. "Any accommodatable combination of servos, load cells, encoders, a SimpleFOC driver, ToF and IMU" has too many combinations to enumerate, and every new peripheral would need a new register range and a new host-side special case.
 
-| Phase | Master | Chains | Realistic rate | Notes |
-|---|---|---|---|---|
-| **A — bring-up** | Jetson + mjbots **fdcanusb** (USB) | 1 × 13 nodes | 250–350 Hz | Works with the stock `moteus` python lib immediately. USB adds ~0.1–0.5 ms jitter — fine for gait development. |
-| **B — spinal cord** | **Core-board STM32G4** as realtime bridge | 2 chains (front legs + head / rear legs + spine), 6–7 nodes each | 400 Hz–1 kHz | G4 parts have **3× FDCAN**. Core board runs the hard-realtime poll loop; Jetson sends high-level targets over USB. Same pattern as mjbots' pi3hat (5 buses). Core board already exists (STM32 + battery telemetry + radios + OLED), so this is an extension, not a new board. |
+A slot model inverts it: **the host discovers a list of typed channels and drives them all through one uniform interface.** Adding a peripheral type adds an enum value, not a register range. The host's channel driver is written once.
 
-The protocol and register map are identical in both phases — only the master moves.
+### 3.2 Channel type enum
 
-## 3. Cadence model: two lanes, one schedule
+`uint8`. **Stable API — values are never reused or renumbered.** Grouped by decade so related types stay adjacent.
 
-Each control cycle the master sends every node **one frame** (command + query) and receives **one reply**:
+| Value | Type | Direction | Resources used |
+|---|---|---|---|
+| `0x00` | `none` | — | slot empty |
+| `0x10` | `servo_rc` | out + optional fb | pulse-capable pin, 5 V rail, optional angle sensor |
+| `0x11` | `bldc_ext` | out + fb | 3× PWM + enable, angle sensor — **see §9.2** |
+| `0x20` | `enc_i2c` | in | I²C address (AS5600 / AS5600L / MT6701) |
+| `0x21` | `enc_spi` | in | SPI + CS (secondary absolute encoder) |
+| `0x30` | `loadcell` | in | external ADC (NAU7802 I²C recommended, HX711 2-wire, ADS1220 SPI) |
+| `0x31` | `adc_in` | in | ADC-capable pin |
+| `0x40` | `imu` | in | onboard LSM6DS3TR-C |
+| `0x41` | `tof` | in | VL53L7CX / VL53L5CX |
+| `0x50` | `pixel` | out | WS2812 data pin |
+| `0x60` | `gpio_in` | in | any GPIO |
+| `0x61` | `gpio_out` | out | any GPIO |
+| `0x70` | `rail_5v` | in | PB11 current sense |
 
-- **Fast lane (every cycle):** position/velocity/torque command + query of mode, position, velocity, torque, voltage/temperature/fault — plus the node's *fast-lane peripherals*: **foot-contact flag (0x08B)** and **AS5600L angle** (via Encoder-2 regs 0x054/0x055, see §6). One extra int8/int16 in an existing subframe costs ~1–3 bytes.
-- **Slow lane (rotating):** each cycle, *one* node's query additionally reads its full sensor block (IMU, ToF summary, rail current, health). 13-node rotation at 325 Hz ⇒ every node's slow block refreshes at ~25 Hz.
-- **Fire-and-forget writes** (NeoPixel mode, servo angle targets, tare command): command frames without the reply bit, dropped into idle slots. No reply cost.
-- **Promotion is free:** if the locomotion NN starts caring about a peripheral (e.g. spine servo state), add its registers to that node's fast query — a host-side change only; firmware is untouched.
+### 3.3 Channel register frame
 
-Client side, this is already supported: `QueryResolution._extra` / `make_custom_query()` in `lib/python/moteus/moteus.py` read arbitrary registers in the same frame as the command.
+Base `0x200`, stride `0x10`, slots 1–8 (`0x210`–`0x28F`; `0x200`–`0x20F` reserved for a future slot 0 alias). Every channel of every type has the same ten core registers:
 
-## 4. Bus budget
+| Offset | Name | R/W | Meaning |
+|---|---|---|---|
+| `+0x0` | `type` | R | channel type enum; `0x00` = slot empty |
+| `+0x1` | `caps` | R | per-type capability bits (has_feedback, has_current, is_calibrated, …) |
+| `+0x2` | `status` | R | per-channel fault/health bits; 0 = healthy |
+| `+0x3` | `mode` | R/W | `0` released/safe (**boot default**), `1` active, ≥2 type-specific |
+| `+0x4` | `cmd_a` | R/W | primary target — angle°, position rev, duty, level, colour |
+| `+0x5` | `cmd_b` | R/W | rate limit — °/s, rev/s |
+| `+0x6` | `cmd_c` | R/W | effort limit — current A, voltage, brightness |
+| `+0x7` | `meas_a` | R | measured primary — angle, distance, force |
+| `+0x8` | `meas_b` | R | measured rate |
+| `+0x9` | `meas_c` | R | measured effort — current, raw counts |
+| `+0xA` | `meas_d` | R | auxiliary — temperature, magnet AGC, signal quality |
+| `+0xB` | `nonce` | R | increments once per update; **staleness detection** |
+| `+0xC`–`+0xF` | type-specific | | e.g. tare command, ToF quadrant minima, pixel index |
 
-Frame time model (CAN-FD, 11-bit id, BRS): ≈ 30 µs of 1 Mbit fields + (8·N + ~43) bits at 5 Mbit for an N-byte payload:
+**The stride is the whole point.** Because subframes address *consecutive* registers:
+
+- a complete channel command is **one write subframe**: 3× int16 at `+0x4`
+- a complete channel readback is **one read subframe**: 4× int16 at `+0x7`
+
+So a node with two active channels adds roughly `2 × (3 + 3·2)` command bytes and `2 × (3 + 4·2)` reply bytes to its frame — about 18 and 22 bytes. That is affordable at gait rate; [§5](#5-cadence-and-bus-budget) does the arithmetic.
+
+### 3.4 Type-specific bindings
+
+Only the interpretation changes; the frame does not.
+
+| Type | `cmd_a` | `cmd_b` | `cmd_c` | `meas_a` | `meas_b` | `meas_c` | `meas_d` |
+|---|---|---|---|---|---|---|---|
+| `servo_rc` | angle ° | slew °/s | — | angle ° (from bound encoder) | °/s | 5 V current A | — |
+| `bldc_ext` | position rev | velocity rev/s | current limit A | position rev | velocity rev/s | current A | driver temp |
+| `enc_i2c` | — | — | — | angle ° | °/s | — | magnet AGC / health |
+| `loadcell` | — | — | — | force (scaled) | d/dt | raw counts | **contact flag** |
+| `imu` | — | — | — | — | — | — | temp — *see §4 note* |
+| `tof` | — | — | — | min distance mm | — | target count | ambient |
+| `pixel` | mode | — | brightness | — | — | — | — |
+| `rail_5v` | — | — | — | current A | — | peak A | — |
+
+**Servo closed-loop is on-node.** `servo_rc` with a bound `enc_i2c` channel runs its own outer position loop against the measured angle, which is precisely the "offloading minor calculations to flexnode" the design calls for — the host writes a target angle at gait rate and the node handles slew limiting, the pulse train, and stall detection from the 5 V current. Binding is config (`flexnode.ch<N>.feedback_ch`), not protocol.
+
+### 3.5 Resolution discipline
+
+moteus's mapped-value scheme means int8/int16/int32/float are four *views* of the same register, differing only in precision. Fixed scales per channel type, chosen so int16 is always sufficient for control and int8 is usable for telemetry:
+
+| Quantity | int8 | int16 | int32 |
+|---|---|---|---|
+| angle ° | 2 | 0.05 | 0.0005 |
+| rate °/s | 10 | 0.5 | 0.005 |
+| position rev | 0.1 | 0.001 | 0.00001 |
+| current A | 0.5 | 0.02 | 0.0002 |
+| force N | 5 | 0.1 | 0.001 |
+| distance mm | 20 | 1 | 0.01 |
+
+Use int16 on the fast lane; it costs 2 bytes and is finer than any of these sensors is accurate.
+
+---
+
+## 4. The node block 0x080–0x0FF (v1, retained)
+
+**The v1 block does not change.** It is flashed, documented, and public. In v2 it is reinterpreted as the *well-known view*: a set of convenience aliases onto the first channel of each type, plus the node header. A host that only ever wants "the IMU" reads `0x098–0x09D` and never touches the channel model; a host that wants to enumerate an arbitrary node uses [§3](#3-the-channel-model). Both are supported forever.
+
+Previously-reserved registers now defined in the node header:
+
+| Reg | Name | R/W | Notes |
+|---|---|---|---|
+| `0x080` | capabilities bitmask | R | *retained.* bit0 load cell, bit1 I²C encoder, bit2 IMU, bit3 ToF, bit4 pixel, bit5 servo, bit6 5 V sense |
+| `0x081` | node status/fault summary | R | *retained* |
+| `0x082` | 5 V rail current | R | *retained* |
+| `0x083` | **profile id** | R | which build is flashed — see [§6](#6-profiles-build-time-roles) |
+| `0x084` | **build hash (low 16)** | R | host asserts the fleet is running the image it expects |
+| `0x085` | **populated channel count** | R | 0 → node has no channels; skip enumeration |
+| `0x086` | **fleet role / master state** | R | see [§7](#7-host-loss-and-inter-node-autonomy) |
+| `0x087` | **host-loss state** | R | 0 nominal, 1 warning, 2 timed out, 3 deputy-commanded |
+| `0x088`–`0x0BF` | peripheral aliases | | *retained* — load cell, encoder, IMU, ToF, pixel, servo |
+| `0x0FF` | **block version → 2** | R | was 1; bump signals the channel model is present |
+
+> **Correction to v1:** the v1 table lists `0x09E` as "IMU temperature". The LSM6DS3TR-C temperature register is die temperature, not motor or ambient temperature, and is only loosely useful. Keep the register, but do not let it be mistaken for a thermal-protection input — that is `0x00E` (FET temp) and the motor NTC.
+
+---
+
+## 5. Cadence and bus budget
+
+### 5.1 Two lanes, one schedule
+
+Unchanged in principle from v1, extended to channels:
+
+- **Fast lane, every cycle:** per node, one frame carrying command + query. Contains the stock axis command (`0x000`, `0x020`–`0x022`), the stock axis query (`0x000`–`0x003`, `0x00D`–`0x00F`), plus each *fast* channel's command and readback subframes.
+- **Slow lane, rotating:** one node per cycle additionally reads its full channel set, node header, and health. At 13 nodes and 325 Hz that is a **25 Hz refresh per node** — ample for IMU bias tracking, ToF, rail current and diagnostics.
+- **Fire-and-forget:** pixel writes, tare commands, servo re-arm. No reply bit, dropped into idle slots.
+- **Promotion is free.** Moving a channel from slow to fast is a host-side schedule change. Firmware is untouched.
+
+### 5.2 Frame time
+
+CAN-FD, 11-bit id, BRS, 5 Mbit data: ≈ 30 µs of arbitration-rate fields + `(8·N + 43)` bits at 5 Mbit for an N-byte payload.
 
 | Payload | Frame time |
 |---|---|
 | 16 B | ~64 µs |
 | 24 B | ~77 µs |
 | 32 B | ~90 µs |
+| 48 B | ~116 µs |
 | 64 B | ~141 µs |
 
-Cycle cost = Σ per node (command frame + reply frame), plus one slow-lane pair:
+### 5.3 Budget by configuration
 
-| Configuration | Cycle cost | @ rate → utilization |
-|---|---|---|
-| 1 chain × 13, rich query (24 B + 24 B) | ~2.1 ms | 400 Hz → **83 % (too hot)** |
-| 1 chain × 13, trimmed int16 (16 B + 16 B) + slow pair | ~1.9 ms | 325 Hz → ~62 % ✓ |
-| 2 chains × 6–7, rich query | ~1.1 ms/chain | 400 Hz → ~45 % ✓ |
-| 2 chains × 6–7, trimmed | ~0.9 ms/chain | 1 kHz → ~90 % (edge; suspend slow lane, 6/7 split) |
+Cycle cost = Σ over nodes (command frame + reply frame) + one slow-lane pair.
 
-Rule of thumb: keep steady-state utilization ≤ 60 % so retransmissions and slow-lane bursts never break the cycle. Hence Phase A targets 250–350 Hz and Phase B makes 400 Hz comfortable.
-
-**Rate guidance:** 400 Hz is ample for CATBOT's gaits — the external RC servos (head/yaw/spine) are 50–330 Hz devices regardless, and FOC runs locally. Revisit 1 kHz only if a future locomotion policy demands sub-ms torque transparency, and then only with Phase B dual chains.
-
-## 5. The FlexNode register block — 0x080–0x0FF
-
-Upstream moteus uses ≤ 0x07f for realtime registers and 0x100–0x158 for info/UUID; **0x080–0x0FF (128 registers) is free** and becomes the FlexNode block. Fixed offsets, identical on every node; unpopulated → `kUnknownRegister` reply. Registers ≥ 0x080 cost a 2-byte varuint address — one extra byte per subframe, negligible.
-
-| Reg | Name | R/W | Notes |
+| Configuration | Per-node payloads | Cycle | @ rate → load |
 |---|---|---|---|
-| 0x080 | **Capabilities bitmask** | R | ✅ bit0 load cell, bit1 AS5600L, bit2 IMU (set when WHO_AM_I answers), bit3 ToF, bit4 NeoPixel, bit5 servo, bit6 5V-sense. Host autodiscovery. |
-| 0x081 | FlexNode status/fault bits | R | peripheral fault summary (I²C errors, servo overcurrent, ToF not-initialized, …) |
-| 0x082 | 5 V rail current | R | PB11 ADC, firmware zero-offset calibrated |
-| 0x083–0x087 | _reserved_ | | |
-| 0x088 | Load cell force (scaled) | R | int16 mapped via `flexnode.loadcell.scale` |
-| 0x089 | Load cell raw | R | |
-| 0x08A | Tare command / status | R/W | write 1 = tare now |
-| **0x08B** | **Contact flag** | R | int8 0/1, thresholded **on-node** (`flexnode.loadcell.threshold`). Cheapest possible fast-lane read; enables local reflexes later. |
-| 0x08C–0x08F | _reserved (2nd cell / hysteresis config)_ | | |
-| 0x090 | AS5600L raw angle | R | primary angle path is Encoder 2 (§6) — this is the raw/aux view |
-| 0x091 | AS5600L magnet/AGC health | R | AGC + MD/ML/MH bits |
-| 0x092–0x097 | _reserved (2nd AS5600L slot)_ | | |
-| 0x098–0x09A | IMU accel X/Y/Z | R | ✅ g: int8 0.1, int16 0.001, int32 1e-5, float; 6 consecutive regs ⇒ one read subframe |
-| 0x09B–0x09D | IMU gyro X/Y/Z | R | ✅ dps: int8 1, int16 0.1, int32 0.001, float |
-| 0x09E | IMU temperature | R | ✅ °C (moteus temperature scaling) |
-| 0x09F | IMU status/nonce | R | ✅ increments per sample — staleness detection; 0 while IMU inactive |
-| 0x0A0 | ToF min distance | R | mm |
-| 0x0A1–0x0A4 | ToF quadrant min distances | R | 4 quadrants of the 8×8 grid |
-| 0x0A5 | ToF target count | R | |
-| 0x0A6 | ToF frame nonce | R | |
-| 0x0A7–0x0AF | _reserved_ | | full 8×8 frame streams over the **diagnostic tunnel**, not registers |
-| 0x0B0 | NeoPixel mode | R/W | ✅ 0 off · 1 solid (2 breathe · 3 chase · 4 custom(tunnel) reserved, currently treated as solid) |
-| 0x0B1–0x0B3 | NeoPixel RGB | R/W | ✅ master colour 0..255 (int16+ on the wire); live, un-persisted — `conf set led.*` clears |
-| 0x0B4 | NeoPixel brightness | R/W | ✅ 0..255 |
-| 0x0B5–0x0B7 | _reserved (2nd color / rate)_ | | |
-| 0x0B8 | Servo 1 angle command | R/W | calibrated degrees → pulse via `flexnode.servo.*` map; raw duty remains available at upstream aux-PWM regs 0x076–0x07f |
-| 0x0B9 | Servo 2 angle command | R/W | |
-| 0x0BA | Servo arm/disarm | R/W | 0 = outputs released (safe default at boot) |
-| 0x0BB | Servo fault/overcurrent status | R | pairs with 0x082 |
-| 0x0BC–0x0BF | _reserved_ | | |
-| 0x0C0–0x0FE | _reserved for future FlexNode use_ | | |
-| 0x0FF | FlexNode block version | R | ✅ = 1; bump on any layout change |
+| 13 nodes, axis only | 16 B / 16 B | ~1.7 ms | 325 Hz → **55 %** ✓ |
+| 13 nodes, axis + 1 fast channel | 24 B / 24 B | ~2.0 ms | 325 Hz → **65 %** ✓ |
+| 13 nodes, axis + 2 fast channels | 32 B / 32 B | ~2.3 ms | 325 Hz → **75 %** ⚠ |
+| 13 nodes, axis + 2 fast channels | 32 B / 32 B | ~2.3 ms | 400 Hz → **92 %** ✗ |
+| 2 chains × 7, axis + 2 fast channels | 32 B / 32 B | ~1.3 ms | 400 Hz → **52 %** ✓ |
+| 2 chains × 7, axis + 2 fast channels | 32 B / 32 B | ~1.3 ms | 1 kHz → **130 %** ✗ |
+| 2 chains × 7, axis + 1 fast channel | 24 B / 24 B | ~1.1 ms | 800 Hz → **88 %** ⚠ |
 
-**Config namespace** (`conf set flexnode.…`, persisted like all moteus config): per-peripheral enables (drive the caps bitmask), `loadcell.scale/threshold/invert`, `servo.N.pulse_min/pulse_max/angle_min/angle_max`, `pixel.count`, `imu.rate_hz`, `tof.enable`.
+**Rules that fall out of this table:**
 
-### Fast/slow lane assignment
+1. Keep steady-state load ≤ 65 %. The headroom absorbs error frames, retransmission, and the slow lane landing on a fat node.
+2. **Two fast channels per node is the practical ceiling on a single 13-node chain.** Budget them deliberately: foot contact and joint angle are worth it; IMU at gait rate usually is not (put it on the slow lane, or fast on only the two or three nodes feeding state estimation).
+3. **1 kHz is not reachable on one chain, and is marginal even on two.** The v1 doc's 400 Hz target is the right one. Revisit only if a locomotion policy demonstrably needs sub-millisecond torque transparency — and note the RC servos are 50–330 Hz devices regardless, and FOC is local at 30 kHz either way.
+4. Splitting front/rear (or left/right) buys nearly 2× and independently buys fault containment. It is the single highest-leverage topology decision.
 
-| Lane | Registers | Rate |
+---
+
+## 6. Profiles (build-time roles)
+
+### 6.1 The principle
+
+The flash budget forces specialisation; the product forbids semantic drift. Both are satisfied by one rule:
+
+> **A profile changes what is compiled in. It never changes what a register means.** A register whose feature is not compiled answers `kUnknownRegister`, exactly as an unpopulated peripheral does.
+
+The host therefore cannot tell — and does not care — whether a channel is missing because the hardware isn't fitted or because the feature wasn't built. It reads `0x080`/`0x085`/`type` and composes its query. **One host implementation drives every profile.**
+
+### 6.2 The profiles
+
+| Profile | id | Axis 0 | Channels compiled | Use |
+|---|---|---|---|---|
+| `full` | 1 | BLDC | all types | dev board, bench, retail default |
+| `joint` | 2 | BLDC | `enc_i2c`, `loadcell`, `imu`, `pixel` | CATBOT hip/knee — the 10 actuator nodes |
+| `aux` | 3 | **none** | `servo_rc`×2, `enc_i2c`×2, `loadcell`, `imu`, `pixel`, `gpio` | spine/tail/head servo nodes |
+| `bldc_ext` | 4 | BLDC | `bldc_ext`, `enc_i2c`×2, `imu`, `pixel` | head gimbal via SimpleFOC driver |
+| `sense` | 5 | **none** | `imu`, `tof`, `loadcell`, `enc_i2c`, `pixel` | pure sensor node |
+
+Implementation is a single `fw/flexnode_profile.h` selected by a Bazel flag, defining `MOTEUS_FLEXNODE_CH_*` macros. Channel drivers are compiled in or out; the register dispatch table is built from the same macros, so an absent driver costs zero bytes and zero cycles.
+
+### 6.3 Where the space actually is
+
+`full` will not fit — there is no argument to be had, only measurement. The ordered levers:
+
+1. **Drop unused encoder drivers.** FlexNode has one SPI encoder (AS5047P) and I²C encoders. moteus carries iC-PZ, MA732, MA600, AksIM-2, CUI AMT21/22, Orbis, BiSS-C, sine/cosine, quadrature and hall. Off the control path → low risk. *Measure from the linker map before cutting.*
+2. **Drop the FOC stack entirely for `aux` and `sense`.** These nodes have no motor. This is by far the largest single reclamation and it is exactly the "dynamic flashing" release valve — but it is deep surgery in `MoteusController` and must not be attempted before the motor path is validated on real hardware.
+3. **Drop `led.imu_demo`** (float HSV). Small, and first to go.
+4. **Extend the app region** only if the linker script genuinely allows it against the bootloader and config-page constraints.
+
+Measurement is in progress; numbers land in [firmware.md](firmware.md) and the recommendation here will be restated with real bytes rather than adjectives.
+
+### 6.4 The rule that keeps this honest
+
+Every node reports its profile id (`0x083`) and build hash (`0x084`). The host asserts both at enumeration and refuses to run a fleet that isn't the image it was tested against. Mixed-image fleets are the failure mode that makes build-time specialisation dangerous, and this is the cheap defence.
+
+---
+
+## 7. Host-loss and inter-node autonomy
+
+The Jetson is explicitly "allowed to be slow, and allowed to crash". A 4.8 kg machine standing on ten torque-producing joints needs a defined answer to *the commands stopped arriving*, and that answer must not depend on the thing that just died.
+
+Three graded levels. **G0 is always on. G1 and G2 are opt-in and default off.**
+
+### G0 — Independent timeout (stock moteus, always active)
+
+Each node already runs a command watchdog: `servo.default_timeout_s` (default 0.1 s) drops the axis into **timeout mode (11)** with configured behaviour. No new code, no bus traffic, no coordination, no shared failure mode. Extended only by config: per-node timeout action (hold position / relax / current-limited hold) and the same for each channel — channels go to `mode = 0` (released) which is why released is the boot default.
+
+**This is the floor and it is never disabled.** Everything below is an optimisation on top of a system that is already safe.
+
+### G1 — Coordinated safe state (broadcast, no election)
+
+The brainstem STM32 — which "stays alive when the Jetson does not" — emits a **presence beacon**: a fire-and-forget broadcast to destination `0x7f` at ~10 Hz carrying a sequence counter and a fleet-state byte. Nodes track beacon age in `0x087`.
+
+- Beacon fresh → nominal.
+- Beacon stale beyond `flexnode.fleet.warn_ms` → warning; node reduces limits, LED indicates.
+- A single broadcast write can command the whole fleet into a named posture in one frame.
+
+Cost is one 8-byte broadcast frame per 100 ms — under 0.1 % bus load. Requires no election, no node-to-node protocol, and no unsolicited transmission by any node. **If the brainstem is healthy, G1 is sufficient and G2 should stay off.**
+
+### G2 — Deputy (config-gated; the only unsolicited transmit)
+
+For the case where the brainstem *also* fails. Each node has `flexnode.fleet.deputy_rank` (0 = never a deputy; **factory default 0**).
+
+1. Beacon age exceeds `fail_ms` → every node is already in G0 timeout, holding safe.
+2. Each candidate waits `rank × stagger_ms`. Staggering, not arbitration, prevents two deputies.
+3. The first to expire begins broadcasting to `0x7f`: a heartbeat plus a **canned safe sequence** — fold, lower, relax.
+4. Any traffic from the host, the brainstem, or a lower rank **instantly demotes** it. Host authority always wins; no negotiation.
+5. Deputy authority **expires** after `authority_ms`. On expiry everything falls back to G0. A deputy cannot rule indefinitely.
+
+Nodes need no changes to accept this: moteus does not inspect the source field, so a deputy's frames are ordinary commands.
+
+**The constraints that make G2 acceptable:**
+
+- The deputy command whitelist contains only *reducing* actions. It can fold, lower, relax, and hold. **It cannot walk, and it cannot raise a limit.** A robot whose host has died should get smaller and lower, never more energetic.
+- Default off, per-node, with an explicit rank. Nothing self-promotes out of the box.
+- It is the single documented exception to poll-response, bounded by a timeout, an authority expiry, and a whitelist. The invariant is *scoped*, not abandoned.
+- Ordinary bus load: **zero**. G2 transmits only when the fleet is already in a failure state.
+
+> Build G0 now (it is free), G1 when the brainstem firmware exists, G2 only once CATBOT actually stands. **G2 is the most dangerous idea in this document** — a node that can command its peers is a node that can command its peers when it is *wrong*. The whitelist and the expiry are what make it survivable, and neither should ever be relaxed for convenience.
+
+### Time sync
+
+Fusing thirteen IMUs eventually needs common time. A broadcast sync tick to `0x7f` lets each node latch an offset against its millisecond counter (`0x070`); host-side timestamping is adequate at slow-lane rates. **Defer until fusion actually needs it** — it is cheap to add and pointless to build early.
+
+---
+
+## 8. Discovery and enumeration
+
+The boot sequence a host runs, and the reason profiles cost the host nothing:
+
+```
+1. for id in 1..127:  read 0x100 (model), 0x150-0x153 (UUID)   → who exists
+2. for each node:     read 0x0FF                               → FlexNode block version
+                        0  → stock moteus, drive as such
+                        1  → v1 block, fixed peripherals only
+                        2  → v2, continue below
+3. for each node:     read 0x080, 0x083, 0x084, 0x085          → caps, profile, build, channel count
+4. assert profile and build hash match the fleet manifest       → refuse mixed images
+5. for slot in 1..channel_count: read 0x200+0x10·slot +0..+1    → type, caps
+6. compose that node's fast-lane query from its channel list
+7. write per-channel config, arm channels (mode = 1)
+8. start the schedule
+```
+
+Steps 1–7 happen once at boot and cost milliseconds. Nothing in the steady-state loop re-discovers anything.
+
+---
+
+## 9. Hardware gaps that this design exposes
+
+Writing the channel model made three v1.0 silicon limits concrete. **These are hardware findings, not protocol problems** — the protocol above is correct regardless; what changes is which channels a v1.0 board can actually populate.
+
+### 9.1 There is exactly one aux output pin, and it has no timer
+
+FlexNode v1.0 brings out **PC13** as its servo/LED output. From the family-0 aux table (`fw/moteus_controller.cc:406`), PC13 has **no timer, no ADC, no I²C, no SPI** — it is a plain RTC-domain GPIO, weak (~3 mA) and slow-slewing. So:
+
+- Servo pulses on PC13 must be **software-timed**. Workable at 50–330 Hz, but it is not a hardware PWM channel.
+- **One** servo output, not "servos". CATBOT needs seven.
+
+**Recommended fix — no board respin:** a **PCA9685** on the existing J2 I²C port. Sixteen hardware PWM channels, 12-bit, over two wires already present; the 5 V current sense on PB11 still monitors the whole rail for stall detection. Seven servos then land on *one* `aux` node instead of being smeared across three, and `servo_rc` channels bind to PCA9685 outputs with no change to anything in §3. This is the single highest-value cheap addition to the design.
+
+### 9.2 The SimpleFOC driver cannot be driven by v1.0 as specified
+
+A SimpleFOC Mini (DRV8313-class) needs **3 PWM + enable**; the dual driver for the head needs two sets. PC13 cannot provide this.
+
+There is a *candidate* path: **PB13/PB14/PB15**, exposed as the SPI2 expansion pads, map to **TIM1_CH1N/CH2N/CH3N** — and TIM1 appears free, because FlexNode's motor PWM is on TIM2 (PA0/PA1/PA2). Three hardware PWM channels from one timer is exactly what a Mini wants.
+
+**Unverified, and two separate costs:**
+
+- It consumes the SPI expansion pads. SPI peripherals and the `bldc_ext` channel become mutually exclusive.
+- It needs a **second commutation loop in firmware** — open-loop or a light closed loop against the bound `enc_i2c`, not a second full FOC stack. Real work, real flash, on a board whose first stack has not yet turned a motor.
+
+**Decision required.** Three options, in my order of preference:
+
+1. **Head gimbals get their own small MCU and become their own CAN node.** The SimpleFOC dual driver already implies a controller; giving it a CAN interface makes it a peer that speaks the same register protocol. Costs a board, buys total independence, and does not touch FlexNode at all. *If that node speaks classic CAN rather than CAN-FD it cannot share this bus* — a classic-only node errors on FD frames. It must be FD, or it must sit on its own bus.
+2. **`bldc_ext` on TIM1 via the SPI pads,** accepting the loss of SPI expansion and the firmware cost. Verify TIM1 availability and pad breakout on real hardware first.
+3. **Drop `bldc_ext` for v1.0** and revisit on a v1.1 that breaks out a proper 4-pin driver header.
+
+### 9.3 One I²C bus carries everything
+
+IMU + ToF + every I²C encoder + a load-cell ADC + a possible PCA9685 all share I²C1 (PB8/PB9). At 400 kHz an AS5600 angle read is ~150 µs and an IMU burst ~300 µs; a node polling both at 1 kHz spends ~45 % of the bus. Two mitigations, both cheap:
+
+- The 2 kΩ pull-ups are already sized for **Fast-mode Plus (1 MHz)**. Running Fm+ cuts all of the above by 2.5×. Verify with a scope on the first assembled node.
+- Poll rates need not match the control rate: an RC servo's outer loop at 200 Hz is plenty, and the IMU at 104 Hz is what the part is configured for anyway.
+
+**Choose I²C parts to keep this bus short:** prefer **NAU7802** (I²C, 24-bit) for load cells over HX711 (2-wire bit-bang, needs two GPIOs that v1.0 does not have to spare) and over ADS1220 (SPI, contends with the same pads as §9.2).
+
+### 9.4 ToF firmware blob
+
+Unchanged from v1 and still the right answer: the VL53L7CX/L5CX needs an ~84 KB blob at every power-on. It cannot live in node flash. The host streams it over the **diagnostic tunnel** at boot and the node forwards it over I²C. Zero flash cost; ToF only initialises when a host is present, which is acceptable because ToF is useless without one. **Bench-validate tunnel throughput before committing** — 84 KB over the tunnel at gait-rate scheduling could take an unpleasantly long time, and thirteen nodes doing it serially at boot could be minutes.
+
+---
+
+## 10. Compatibility contract
+
+What FlexNode promises, so the register map can be published:
+
+1. **L0/L1 are stock moteus.** `moteus_tool`, `tview`, the Python library, and the CAN bootloader work against any FlexNode. `kRegisterMapVersion` stays 5.
+2. **Register semantics are immutable.** A meaning, scale, or unit is never changed. Registers are deprecated (permanently reserved, answering `kUnknownRegister`), never recycled.
+3. **`0x0FF` is the block version.** It increments only on layout change. A host reads it first and knows exactly what it is talking to. v0 = stock moteus, v1 = fixed peripherals, v2 = channel model.
+4. **Type enum values are permanent.** New peripheral types take new values.
+5. **Absence is uniform.** Not populated, not configured, and not compiled are indistinguishable to a host, and all answer `kUnknownRegister`.
+6. **Boot state is safe.** Every channel boots to `mode = 0` (released). Nothing energises because a node powered up.
+
+---
+
+## 11. Build order
+
+Each step is independently testable, and nothing here requires a motor to turn.
+
+| # | Step | Gate |
 |---|---|---|
-| Fast (every cycle) | 0x000–0x003, 0x00d–0x00f (stock) + 0x08B contact + 0x054/0x055 AS5600L | 250–400 Hz |
-| Fast optional | 0x098–0x09D IMU (nodes feeding state estimation; or half-rate) | ≤ loop rate |
-| Slow (rotating) | 0x080–0x082, 0x088–0x08A, 0x090–0x091, 0x098–0x09F, 0x0A0–0x0A6, 0x0BB | ~25 Hz/node |
-| Fire-and-forget | 0x08A tare, 0x0B0–0x0B4 pixels, 0x0B8–0x0BA servos | as needed |
+| 1 | **Get a CAN adapter.** Everything below is blind without one. | — |
+| 2 | Verify the v1 block over CAN: read `0x080`, `0x0FF`, IMU; write a pixel colour; check `bus_V` against a DMM. | adapter |
+| 3 | Measure the flash map; cut unused encoder drivers with real numbers. | — |
+| 4 | Channel infrastructure: dispatch, `type`/`caps`/`status`/`mode`, enumeration. No drivers yet — an empty node that enumerates correctly is the real milestone. | 3 |
+| 5 | `enc_i2c` (AS5600 / MT6701) — first real channel, no actuation, safe to iterate. | 4, encoder in hand |
+| 6 | `loadcell` via NAU7802, including on-node contact thresholding. | 4 |
+| 7 | `servo_rc`, software-timed on PC13 — or on a PCA9685 per §9.1. | 4 |
+| 8 | Profiles: `flexnode_profile.h`, the Bazel flag, `joint` and `aux` builds, `0x083`/`0x084`. | 3, 4 |
+| 9 | G0 host-loss config; per-channel timeout actions. | 4 |
+| 10 | Multi-node bring-up: two nodes, distinct ids, enumeration, measured bus load against §5. | 2, 8 |
+| 11 | G1 beacon, once brainstem firmware exists. | 10 |
+| 12 | `bldc_ext`, `tof`, G2 deputy, time sync. | everything above, and §9.2 decided |
 
-## 6. Reuse map — what already exists in moteus
+**Unchanged hard gates:** the AS5047 must be soldered before any position work, and **phase order must be validated on a current-limited supply before any calibration or sustained motor drive**. None of steps 1–12 requires violating either.
 
-| FlexNode need | Existing mechanism | Delta required |
-|---|---|---|
-| AS5600L angle at loop rate | I²C encoder as `motor_position` source → **Encoder 2 regs 0x054/0x055** (position + velocity, PLL-filtered) | upstream supports AS5600 only: add `kAs5600L` to `I2C::DeviceConfig::Type` (`fw/aux_common.h`) + programmable-address handling |
-| External RC servos | aux pin `kPwmOutput`, regs 0x076–0x07f, `pwm_period_us` config | calibrated-angle wrapper regs 0x0B8+ (small) |
-| Load cell (analog amp, e.g. HX711-less bridge amp) | aux pin `kAnalogInput`, regs 0x060+ | scaling/threshold/tare logic + regs 0x088+ (if HX711 chosen instead: new bit-bang driver — decide at bring-up) |
-| GPIO odds and ends | aux GPIO command/status regs 0x05c–0x05f | none |
-| Per-node config | `PersistentConfig` (`conf set/write`) | add `flexnode.*` structs |
-| Big transfers (ToF frames, pixel patterns) | multiplex **diagnostic tunnel** (stream channel) | framing convention only |
-| IMU, ToF, NeoPixel drivers | — none upstream — | net-new firmware (see roadmap) |
+---
 
-## 7. Flash budget & open items
+## 12. Open questions
 
-~17 KiB free on the 512 KB CEU6 as of 2026-09-06, with the WS2812 driver, IMU and the register skeleton in ([firmware.md](firmware.md)). Load-cell, ToF-summary and servo wrappers must be written lean against existing primitives (aux I²C engine, aux ADC, aux PWM); the IMU tilt demo is the first thing to drop if space runs out.
-
-- ⚠️ **VL53L7CX requires an ~84 KB firmware blob uploaded to the sensor at every power-on — it cannot live in node flash.** Design answer: the **host streams the blob over the CAN diagnostic tunnel at boot**, the node forwards it to the sensor over I²C. Zero flash cost; the trade is that ToF only initializes when a host is present (acceptable — ToF is useless without the host anyway). Bench-validate tunnel throughput for an acceptable boot time before committing.
-- AS5600L enum + address extension (small, do with encoder bring-up).
-- HX711 vs analog bridge amp for load cells — decide when the foot design lands; both paths documented above.
-- Multi-node time sync (fusing 13 IMUs): stock millisecond-counter reg 0x070 + host-side timestamping is fine at 25 Hz; if fusion later needs tighter sync, a broadcast (id 0x7f) "sync tick" write is protocol-legal and cheap — defer until needed.
-- `kRegisterMapVersion` stays 5 (upstream compatible); FlexNode block versioned separately at 0x0FF.
+1. **10 BLDC actuators vs 13 nodes** — what are the other three? Changes the profile mix, not the protocol.
+2. **§9.2: how does the head gimbal driver connect?** Own CAN node (preferred), TIM1 on the SPI pads, or deferred to v1.1.
+3. **PCA9685 for servos?** Recommended, cheap, needs a decision before the `aux` node's connector work.
+4. **Load-cell ADC part** — NAU7802 recommended; decide when the foot design lands.
+5. **Brainstem MCU** — the site says STM32G0 in one place and STM32G4 in another. G0 has no FDCAN; if the brainstem is to be the realtime bus master in Phase B it must be a G4 (3× FDCAN). Worth settling early, since it determines whether the two-chain topology in §5 is reachable at all.
+6. **Is the Jetson on the CAN bus in production, or only via the brainstem?** Determines whether there are two masters and whether G1's beacon comes from one place or two.
