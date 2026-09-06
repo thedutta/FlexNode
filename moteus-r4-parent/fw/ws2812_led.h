@@ -42,12 +42,14 @@ namespace moteus {
 /// fault code instead - tens digit in amber, units digit in red, long
 /// pause, repeat.  e.g. fault 35 (encoder) = 3 amber, gap, 5 red.
 ///
-/// Timing: the WS2812 stream is bit-banged from the main loop using the
-/// DWT cycle counter.  Interrupts are masked only for the HIGH part of
-/// each bit (<= ~0.85 us), never across a whole frame, so the 30 kHz
-/// control ISR sees sub-microsecond added jitter and can still preempt
-/// during the LOW part of any bit (the WS2812B tolerates long lows up
-/// to its >50 us reset window; the ISR is far shorter than that).
+/// Timing: the WS2812 stream is bit-banged from the main loop, each pulse
+/// measured on the DWT cycle counter (real core cycles, immune to flash
+/// stalls), with a bounded spin.  Interrupts are masked only for the HIGH
+/// part of each bit
+/// (< ~1 us), never across a whole frame, so the 30 kHz control ISR sees
+/// sub-microsecond added jitter and can still preempt during the LOW part
+/// of any bit (the WS2812B tolerates long lows up to its >50 us reset
+/// window; the ISR is far shorter than that).
 /// Frames are only sent when the picture changes (plus a 1 Hz refresh),
 /// so a static colour costs the main loop nothing.
 class Ws2812Led {
@@ -178,6 +180,17 @@ class Ws2812Led {
   uint32_t last_tx_ms_ = 0;
   bool ever_sent_ = false;
 
+  // Pixel-0 OK-breath state.
+  uint32_t ok_anim_start_ms_ = 0;
+  bool ok_was_active_ = false;
+
+  // Cycle counts for the WS2812B waveform at the current core clock, and
+  // whether the DWT cycle counter was verified to be running at init.
+  uint32_t t1h_cycles_ = 0;
+  uint32_t t0h_cycles_ = 0;
+  uint32_t tbit_cycles_ = 0;
+  bool dwt_ok_ = false;
+
   // Fault blink schedule: a list of (colour, duration) steps.
   struct Step {
     Rgb color;
@@ -190,10 +203,6 @@ class Ws2812Led {
   uint32_t schedule_step_start_ms_ = 0;
   int32_t schedule_code_ = 0;
 
-  // Cycle counts for the WS2812B waveform at the current core clock.
-  uint32_t t1h_cycles_ = 0;
-  uint32_t t0h_cycles_ = 0;
-  uint32_t tbit_cycles_ = 0;
 };
 
 }  // namespace moteus

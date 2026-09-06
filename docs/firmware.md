@@ -110,7 +110,11 @@ Pixel 0 is the onboard LED; pixels 1..`led.count` are external "master control" 
 | `led.master_r/g/b` | 0 / 80 / 255 | colour every pixel shows unless individually overridden |
 | `led.fault_override` | 1 | pixel 0 blinks the fault code while `servo_stats.mode == 1 (fault)` |
 
-Fault code display: tens digit as amber blinks, gap, units digit as red blinks, long pause, repeat (a `0` units digit is one long red). Fault 35 (encoder) = 3 amber · 5 red. Telemetry group `led` reports frames sent, pixel count, the fault code being shown and pixel 0's colour.
+**Pixel 0 states**, highest precedence first: fault → blink code; `led.imu_demo` → IMU tilt colour; otherwise **OK** = one blue fade-in (0.9 s) / fade-out (1.6 s) on entering OK, then dark. Re-armed whenever the board returns to OK (e.g. a fault clears). External pixels 1..N are unaffected and simply hold the master colour.
+
+Fault code display: tens digit as amber blinks, gap, units digit as red blinks, long pause, repeat (a `0` units digit is one long red). Fault 35 (encoder) = 3 amber · 5 red. Telemetry group `led` reports frames sent, mode, pixel count, the fault code being shown and pixel 0's colour.
+
+**Timing, and why it is the way it is (bring-up lesson, 2026-09-06).** Pulses are measured on the DWT cycle counter with a bounded spin. Two open-loop alternatives were tried on hardware and both failed in instructive ways: a counted `subs/bne` loop ran faster than assumed, shrinking the '0' pulse to ~230 ns, below the WS2812B's detection floor, so an all-'0' OFF frame registered nothing and the LED held its last colour indefinitely (coloured frames still rendered because their long '1' pulses carried the picture); unrolled NOPs ran slower than one cycle each under flash wait-state stalls, pushing '0' past the ~550 ns threshold, so '0's read as '1' and OFF decoded as turquoise. The cycle counter counts real core cycles and is immune to both. A static picture is sent exactly once (the WS2812B latches); there is no periodic refresh, which removed an occasional one-frame dimming caused by a resend colliding with an interrupt burst.
 
 Live control today: `conf set led.master_r 255` etc. over the diagnostic channel (`moteus_tool --console`), `conf write` to persist. `Ws2812Led::SetPixel()` is the per-pixel hook for the CAN register block in [`can-layer.md`](can-layer.md).
 
@@ -135,6 +139,9 @@ Implemented in `moteus_controller.cc` as additional `Register` enum values plus 
 cd moteus-r4-parent
 tools/bazel build --config=target //:target      # repo-pinned Bazel 7.4.1
 # flash via SWD (FLASH header: NRST·CLK·DIO·3V3·GND) or, once running, the moteus CAN bootloader
+# NRST: wire it while the ST-Link is powered by the laptop (it helps the debugger connect and
+# does not hold the board). An UNPOWERED ST-Link left wired to NRST drags the line low and holds
+# the board in reset, so for standalone running either unplug the ST-Link entirely or leave NRST off.
 ```
 
 Windows/WSL notes (learned the hard way):

@@ -21,15 +21,46 @@
 namespace moteus {
 
 namespace {
-// WS2812B waveform (datasheet: T0H 0.40 us, T1H 0.80 us, period 1.25 us,
-// each +/- 150 ns).  We aim slightly under on T0H for margin against the
-// ~550 ns decode threshold, and give every bit a full 1.30 us period.
+// WS2812B waveform (datasheet: T0H ~0.40 us, T1H ~0.80 us, period ~1.25 us,
+// each +/- 150 ns; 0/1 decode threshold ~0.55 us).  Pulses are timed with
+// the DWT cycle counter, which counts real core cycles and is therefore
+// immune to flash wait-state stalls.  Open-loop delays were tried and
+// failed both ways: a counted subs/bne loop ran fast (T0H ~230 ns, below
+// the detection floor, so an all-'0' OFF frame registered nothing and the
+// LED held its last colour), and unrolled NOPs ran slow (stalls pushed
+// T0H past the threshold, so '0's read as '1' and OFF decoded turquoise).
 constexpr uint32_t kT0HNs = 350;
 constexpr uint32_t kT1HNs = 800;
 constexpr uint32_t kBitNs = 1300;
 
-constexpr uint32_t kMinFrameIntervalMs = 10;   // never faster than 100 Hz
-constexpr uint32_t kRefreshIntervalMs = 1000;  // resend a static picture at 1 Hz
+// Upper bound on spin iterations per pulse phase, so a stopped cycle
+// counter can only produce a wrong pulse, never a hung main loop.
+constexpr uint32_t kSpinGuard = 4096;
+
+constexpr uint32_t kMinFrameIntervalMs = 10;   // cap change updates at 100 Hz
+
+// Pixel-0 "OK" breath: fade in, fade out, then stay dark.
+constexpr uint32_t kOkFadeInMs = 900;
+constexpr uint32_t kOkFadeOutMs = 1600;
+
+// 0..256 smoothstep brightness envelope for the OK breath.
+uint32_t OkEnvelope(uint32_t t_ms) {
+  const auto ss = [](float u) -> float {         // smoothstep, 0..1
+    if (u <= 0.0f) { return 0.0f; }
+    if (u >= 1.0f) { return 1.0f; }
+    return u * u * (3.0f - 2.0f * u);
+  };
+  if (t_ms < kOkFadeInMs) {
+    return static_cast<uint32_t>(
+        ss(static_cast<float>(t_ms) / kOkFadeInMs) * 256.0f);
+  }
+  const uint32_t t2 = t_ms - kOkFadeInMs;
+  if (t2 < kOkFadeOutMs) {
+    return static_cast<uint32_t>(
+        (1.0f - ss(static_cast<float>(t2) / kOkFadeOutMs)) * 256.0f);
+  }
+  return 0;  // faded out; stay dark
+}
 
 // Fault blink cadence.
 constexpr uint16_t kBlinkOnMs = 150;
@@ -61,10 +92,16 @@ Ws2812Led::Ws2812Led(mjlib::micro::PersistentConfig* persistent_config,
                               [this]() { this->ConfigUpdated(); });
   telemetry_manager->Register("led", &status_);
 
-  // Make sure the DWT cycle counter is running (moteus.cc enables it
-  // too; this is idempotent).
+  // Enable the DWT cycle counter (moteus.cc does this too; idempotent)
+  // and confirm it is advancing.  If it ever were not, transmit is
+  // skipped rather than emitting garbage or spinning.
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  {
+    const uint32_t a = DWT->CYCCNT;
+    for (volatile int i = 0; i < 64; i++) {}
+    dwt_ok_ = (DWT->CYCCNT != a);
+  }
 
   UpdateTiming();
 }
@@ -226,12 +263,6 @@ void Ws2812Led::PollMillisecond() {
   const uint8_t brightness = static_cast<uint8_t>(this->brightness());
   const Rgb off{0, 0, 0};
 
-  Rgb want[kMaxPixels];
-  for (int32_t i = 0; i < pixels; i++) {
-    want[i] = (mode_ == 0) ? off : (has_override_[i] ? override_[i] : master);
-  }
-  if (config_.imu_demo) { want[0] = ImuDemoPixel(); }
-
   int32_t fault_code = 0;
   if (config_.fault_override && servo_ &&
       servo_->status().mode == BldcServoMode::kFault) {
@@ -239,7 +270,30 @@ void Ws2812Led::PollMillisecond() {
     if (fault_code == 0) { fault_code = 1; }  // faulted with no code: still show something
   }
   if (fault_code != schedule_code_) { RebuildFaultSchedule(fault_code); }
-  if (fault_code != 0) { want[0] = FaultPixel(); }
+
+  // "OK" = running, no fault, not in the IMU demo.  Pixel 0 gives one blue
+  // fade-in / fade-out on entering OK, then stays dark; re-armed each time
+  // the board returns to OK (e.g. after a fault clears).
+  const bool ok_state = (mode_ != 0) && (fault_code == 0) && !config_.imu_demo;
+  if (ok_state && !ok_was_active_) { ok_anim_start_ms_ = ms_; }
+  ok_was_active_ = ok_state;
+
+  Rgb want[kMaxPixels];
+  for (int32_t i = 0; i < pixels; i++) {
+    want[i] = (mode_ == 0) ? off : (has_override_[i] ? override_[i] : master);
+  }
+  // Pixel 0 status, highest precedence first.
+  if (fault_code != 0) {
+    want[0] = FaultPixel();
+  } else if (config_.imu_demo) {
+    want[0] = ImuDemoPixel();
+  } else if (mode_ != 0) {
+    const uint32_t env = OkEnvelope(ms_ - ok_anim_start_ms_);   // 0..256
+    const Rgb base = has_override_[0] ? override_[0] : master;
+    want[0] = Rgb{static_cast<uint8_t>((base.r * env) >> 8),
+                  static_cast<uint8_t>((base.g * env) >> 8),
+                  static_cast<uint8_t>((base.b * env) >> 8)};
+  }
 
   status_.mode = mode_;
   status_.pixels = pixels;
@@ -248,18 +302,18 @@ void Ws2812Led::PollMillisecond() {
   status_.p0_g = want[0].g;
   status_.p0_b = want[0].b;
 
-  // --- Send only if it changed (or for the periodic refresh). ---
+  // --- Send only if it changed. ---
   bool changed = !ever_sent_ ||
       pixels != shown_count_ ||
       brightness != shown_brightness_;
   for (int32_t i = 0; !changed && i < pixels; i++) {
     if (want[i] != shown_[i]) { changed = true; }
   }
-  const uint32_t since_tx = ms_ - last_tx_ms_;
-  if (!(changed && since_tx >= kMinFrameIntervalMs) &&
-      since_tx < kRefreshIntervalMs) {
-    return;
-  }
+  // WS2812B latches and holds its last value, so a static picture is sent
+  // exactly once -- no periodic refresh (a resend landing during an
+  // interrupt burst is what caused the occasional one-frame dimming).
+  if (!changed) { return; }
+  if ((ms_ - last_tx_ms_) < kMinFrameIntervalMs) { return; }  // rate-limit changes
 
   for (int32_t i = 0; i < pixels; i++) { shown_[i] = want[i]; }
   shown_count_ = pixels;
@@ -270,19 +324,23 @@ void Ws2812Led::PollMillisecond() {
 }
 
 void Ws2812Led::SendBit(bool one) {
+  // Interrupts off only for the high pulse (<1 us), so the 30 kHz control
+  // ISR gains sub-microsecond jitter at most.  The low period is left
+  // interruptible; if an ISR stretches it, the WS2812B tolerates a long
+  // low (it only latches after >50 us), so a stretched low never corrupts
+  // the frame.
   const uint32_t high = one ? t1h_cycles_ : t0h_cycles_;
-  // Interrupts off only for the high pulse.  Nothing else can touch
-  // DWT->CYCCNT in this window (the control ISR zeroes it, which is why
-  // the pulse is measured as a difference, and why the low wait below
-  // is allowed to end early: if an ISR ran, it lasted far longer than
-  // the minimum low time anyway).
+  // Interrupts off only for the high pulse.  The control ISR zeroes
+  // CYCCNT, which is why the pulse is measured as a difference and why the
+  // low wait may end early: if an ISR ran during it, that already lasted
+  // longer than the minimum low time.
   __disable_irq();
   const uint32_t start = DWT->CYCCNT;
   pin_->set();
-  while ((DWT->CYCCNT - start) < high) {}
+  for (uint32_t g = 0; (DWT->CYCCNT - start) < high && g < kSpinGuard; g++) {}
   pin_->clear();
   __enable_irq();
-  while ((DWT->CYCCNT - start) < tbit_cycles_) {}
+  for (uint32_t g = 0; (DWT->CYCCNT - start) < tbit_cycles_ && g < kSpinGuard; g++) {}
 }
 
 void Ws2812Led::SendByte(uint8_t value) {
@@ -292,6 +350,7 @@ void Ws2812Led::SendByte(uint8_t value) {
 }
 
 void Ws2812Led::Transmit() {
+  if (!dwt_ok_) { return; }
   const uint8_t brightness = static_cast<uint8_t>(shown_brightness_);
   for (int32_t i = 0; i < shown_count_; i++) {
     // WS2812B byte order is G, R, B.
