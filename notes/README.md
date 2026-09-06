@@ -13,10 +13,16 @@ Working notes for the FlexNode firmware and bench, kept so that each new session
 | [`ws2812-led.md`](ws2812-led.md) | The status LED: behaviour, why the timing is DWT-only, the "colour that never turns off" trap |
 | [`firmware-map.md`](firmware-map.md) | Where things live in the fork, how to add a register / an aux I²C device / a config group |
 | [`bringup-log.md`](bringup-log.md) | Chronological record of what was validated when, and the remaining hard gates |
-| [`open-questions.md`](open-questions.md) | Decisions still pending: flash budget strategy, SimpleFOC topology, CAN adapter, encoder |
+| [`hardware-io.md`](hardware-io.md) | What I/O the board actually has, per-node peripheral assignment, and the trades available |
+| [`can-layer-design.md`](can-layer-design.md) | Why the CAN layer is shaped the way it is — decisions and the reasoning behind them |
+| [`flash-findings.md`](flash-findings.md) | Where the flash actually went, measured. Overturns an earlier assumption |
+| [`open-questions.md`](open-questions.md) | Decisions still pending: CAN adapter, encoder, head-gimbal topology, node count |
 
 Conventions:
 - Dates are absolute (YYYY-MM-DD). "Today" rots.
+- **Findings carry a date and time stamp** — `YYYY-MM-DD HH:MM TZ` — at the point the finding is
+  recorded. Aditya asked for this on 2026-09-07 so that the order things were learned in stays
+  recoverable, and it applies to every future finding, not just the ones already here.
 - A `> Gotcha:` callout marks something that already cost real time.
 - `<!-- self: ... -->` HTML comments are notes-to-self for Claude; invisible on GitHub, visible in the source.
 - When a note stops being true, edit it. Don't append contradictions.

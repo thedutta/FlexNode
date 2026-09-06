@@ -2,21 +2,22 @@
 
 Decisions not yet made, with the current recommendation. Edit in place when one closes.
 
-## 1. Flash budget (the constraint that shapes everything)
-~16 KiB free at `ef0d948`. Still to add: servo wrappers (0x0B8–0x0BB), load cell + on-node contact flag (0x088–0x08B), SimpleFOC relay, ToF summary registers. Each is small (1–3 KiB) but there is no margin.
+## 1. Flash budget — MEASURED 2026-09-07, largely solved
+~16.8 kB free at bee0685. **See docs/flash-budget.md.** The old recommendation in this file was
+wrong about where the space is, and is superseded.
 
-Recommendation, in order:
-1. **Reclaim** the unused encoder drivers from the aux port (BiSS-C, iC-PZ, MA732, AKSIM2, MA600, CUI AMT21/22, Orbis, AS5048, sine/cosine, quadrature, hall). FlexNode uses only the onboard AS5047 (SPI) and the AS5600L (I²C). Off the control path, so low risk. **Measure from the linker map first**; cut with numbers.
-2. Keep **one image**. Capabilities register 0x080 already lets the host discover per-node roles; config differentiates nodes.
-3. Per-role images only if a role genuinely won't fit. Stripping FOC for pure I/O nodes would free the most but is deep surgery in `MoteusController`.
-4. `led.imu_demo` (float HSV) is the first thing to drop if space runs out.
+> Gotcha: the assumption was "reclaim the unused encoder drivers first". Measured, they are only
+> ~13.4 kB and several already measure **zero** — `--gc-sections` had removed them years ago.
+> The real lever is mjlib serialisation: **79,518 B (18% of the image)** of SerializableHandler<T>
+> template instantiation, ~32 kB of it droppable by deleting telemetry registrations. The tell was
+> ws2812_led.o at 13.8 kB for a driver whose actual logic is 3.9 kB — the other 8.4 kB was schema
+> and text-parsing code for its Config and Status structs. Every Register() call costs 2-8 kB.
 
-Aditya's stance: "17 kB is way too less"; open to trimming, dynamic per-role flashing, or both.
-**Resolved 2026-09-07:** reflash-on-hardware-change is explicitly acceptable ("hardware changes can
-neither be made at runtime, so no hot-plugging and reflashes on hardware changes are fully
-acceptable"). That unlocks build-time profiles — see docs/can-layer.md §6. Dropping the FOC stack
-entirely for motor-less `aux`/`sense` nodes is the largest single lever, and the only one that
-touches the motor path, so it comes last.
+Order: (1) drop 7 telemetry registrations ~32 kB, (2) re-measure, (3) nano.specs ~22 kB exposure,
+(4) -Os on moteus_controller.o, (5) encoder drivers / BoardDebug, (6) motor-less profiles LAST
+(touches the motor path; probably never needed).
+
+Consequence: profiles are no longer load-bearing for space. One image fits the whole v2 CAN layer.
 
 ## 2. SimpleFOC driver topology — ANSWERED (2026-09-07), but blocked on hardware
 Aditya: the SimpleFOC driver is a **peripheral of a FlexNode**, with its own AS5600 for feedback

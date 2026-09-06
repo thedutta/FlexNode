@@ -167,8 +167,45 @@ Previously-reserved registers now defined in the node header:
 | `0x087` | **host-loss state** | R | 0 nominal, 1 warning, 2 timed out, 3 deputy-commanded |
 | `0x088`–`0x0BF` | peripheral aliases | | *retained* — load cell, encoder, IMU, ToF, pixel, servo |
 | `0x0FF` | **block version → 2** | R | was 1; bump signals the channel model is present |
+| `0x0C0`–`0x0C3` | **node name** | R | 16 UTF-8 bytes, NUL-padded, int32 only — see below |
 
 > **Correction to v1:** the v1 table lists `0x09E` as "IMU temperature". The LSM6DS3TR-C temperature register is die temperature, not motor or ambient temperature, and is only loosely useful. Keep the register, but do not let it be mistaken for a thermal-protection input — that is `0x00E` (FET temp) and the motor NTC.
+
+---
+
+### 4.1 Node identity — a name, not just a number
+
+Aditya, 2026-09-07: *"each flexnode should also have a local id/name, for example the 2x shoulder
+8108-8 flexnodes each have the gim 8108-8 connected to it, and a simplefocmini, and one of them
+also have a ds3235 servo attatched, the other has free functionality."*
+
+A numeric CAN id is an address, not an identity. Two nodes with the same silicon, the same profile
+and the same channel list can still be *the front-left shoulder* and *the front-right shoulder*,
+and every log line, fault report and calibration file wants to say which. So a node carries three
+distinct things, and they should not be conflated:
+
+| | What it is | Where | Changes when |
+|---|---|---|---|
+| **CAN id** | bus address, 1–127 | `id.id` config | rewired or re-addressed |
+| **UUID** | immutable silicon serial | registers `0x150`–`0x153` | never |
+| **Name** | human-meaningful role | `flexnode.name` config → registers `0x0C0`–`0x0C3` | the board is moved to a different joint |
+
+`flexnode.name` is a **16-byte NUL-padded UTF-8 string** exposed as four consecutive int32
+registers, deliberately mirroring how moteus already publishes its UUID at `0x150`–`0x153`. Four
+consecutive registers means the host reads a whole name in **one subframe**, once, at enumeration.
+Sixteen bytes is enough for `shoulder_fl`, `knee_rr`, `spine_mid`, and short enough to never
+tempt anyone into putting a description there.
+
+Why registers and not just a config string readable over the text protocol: the text protocol is
+slow, is not available to a minimal host, and would make the name unavailable exactly when it is
+most wanted — in a fault dump. Sixteen bytes of register space is a cheap price for every log line
+being legible.
+
+**The host should assert the mapping.** At enumeration it reads CAN id, UUID and name together and
+checks them against its fleet manifest. A board swapped between joints without its name being
+updated is then caught immediately, instead of showing up as a limp three weeks later. This pairs
+with the profile/build-hash check in [§6.4](#64-the-rule-that-keeps-this-honest) — same idea,
+same moment, one refusal.
 
 ---
 
@@ -242,14 +279,38 @@ Implementation is a single `fw/flexnode_profile.h` selected by a Bazel flag, def
 
 ### 6.3 Where the space actually is
 
-`full` will not fit — there is no argument to be had, only measurement. The ordered levers:
+**Measured 2026-09-07 — see [flash-budget.md](flash-budget.md).** The result overturned the
+assumption this section originally carried, twice.
 
-1. **Drop unused encoder drivers.** FlexNode has one SPI encoder (AS5047P) and I²C encoders. moteus carries iC-PZ, MA732, MA600, AksIM-2, CUI AMT21/22, Orbis, BiSS-C, sine/cosine, quadrature and hall. Off the control path → low risk. *Measure from the linker map before cutting.*
-2. **Drop the FOC stack entirely for `aux` and `sense`.** These nodes have no motor. This is by far the largest single reclamation and it is exactly the "dynamic flashing" release valve — but it is deep surgery in `MoteusController` and must not be attempted before the motor path is validated on real hardware.
-3. **Drop `led.imu_demo`** (float HSV). Small, and first to go.
-4. **Extend the app region** only if the linker script genuinely allows it against the bootloader and config-page constraints.
+The best lever costs **no code at all**: there is a **48,680 B hole in the flash map** between the
+472 B vector table and the CAN bootloader at 0x0800C000 — `fw/stm32g474.ld` even labels part of it
+"currently unused". Moving `*(.rodata*)` (23,102 B) into the `.isr_vector` output section reclaims
+it, and `moteus_tool`, the bootloader and the export scripts all keep working unchanged because
+they operate on that section by name.
 
-Measurement is in progress; numbers land in [firmware.md](firmware.md) and the recommendation here will be restated with real bytes rather than adjectives.
+Ordered levers, with measured bytes:
+
+1. **Linker-script gap — ~23 kB immediately, ~47 kB available.** No code change.
+2. **newlib-nano** + `-u _printf_float` — 28 kB exposed, saving unmeasured.
+3. **C++ throw-stub chain** — 11,357 B ceiling, severed by one FlexNode-owned file.
+4. **Measured unused drivers** — iC-PZ 6,637, UART `kSerial` 5,917, BiSS-C 3,832, quadrature 1,816,
+   MA732 1,040 = **19,242 B**.
+5. **Motor-less profiles** — largest of all (`bldc_servo.o` is 104.5 kB) and the only lever
+   touching the motor path. **Not before hardware validation**, and now almost certainly never
+   needed for space.
+
+**Realistic total without going near the drive path: ≥42 kB**, against 16,848 B free today.
+
+Also measured, and worth knowing even though the droppable subset is small: **18 % of the image
+(79,518 B) is mjlib serialisation boilerplate** — every `PersistentConfig` / `TelemetryManager`
+registration costs 2–8 kB. The tell was `ws2812_led.o` at 13.8 kB for a driver whose logic is
+3.9 kB. Most registrations turn out to be load-bearing (`conf set` writes through them), so this is
+a fact to design against rather than a lever to pull.
+
+> **This demotes profiles from necessity to choice.** The entire v2 channel model, load cell,
+> servo and ToF work fits in one image with room to spare. Profiles stay because a motor-less node
+> that never links the FOC stack is a *safety property* and a product decision — but they are no
+> longer a byte-count workaround, and `full` is comfortably plausible as the retail default.
 
 ### 6.4 The rule that keeps this honest
 
@@ -332,18 +393,43 @@ Steps 1–7 happen once at boot and cost milliseconds. Nothing in the steady-sta
 
 Writing the channel model made three v1.0 silicon limits concrete. **These are hardware findings, not protocol problems** — the protocol above is correct regardless; what changes is which channels a v1.0 board can actually populate.
 
-### 9.1 There is exactly one aux output pin, and it has no timer
+### 9.1 One aux output pin, no timer — but this is not the problem it looked like
 
-FlexNode v1.0 brings out **PC13** as its servo/LED output. From the family-0 aux table (`fw/moteus_controller.cc:406`), PC13 has **no timer, no ADC, no I²C, no SPI** — it is a plain RTC-domain GPIO, weak (~3 mA) and slow-slewing. So:
+FlexNode v1.0 brings out **PC13** as its servo/LED output. From the family-0 aux table
+(`fw/moteus_controller.cc:406`), PC13 has **no timer, no ADC, no I²C, no SPI** — a plain
+RTC-domain GPIO, weak (~3 mA) and slow-slewing. So a servo pulse on PC13 must be
+**software-timed**. Workable at 50–330 Hz, but it is not a hardware PWM channel.
 
-- Servo pulses on PC13 must be **software-timed**. Workable at 50–330 Hz, but it is not a hardware PWM channel.
-- **One** servo output, not "servos". CATBOT needs seven.
+> **Withdrawn recommendation.** An earlier revision of this section called this a real problem and
+> recommended a **PCA9685** I²C PWM expander to get seven servos onto one node. Aditya, 2026-09-07:
+> **the 7 servos hang off 7 *different* FlexNodes, never two on the same one** — the mechanical
+> layout was spaced that way from the beginning. One software-timed pulse per node is therefore
+> sufficient, and the expander solved a problem that does not exist. The lesson is to ask how the
+> mechanical layout distributes load before optimising a per-node resource.
 
-**Recommended fix — no board respin:** a **PCA9685** on the existing J2 I²C port. Sixteen hardware PWM channels, 12-bit, over two wires already present; the 5 V current sense on PB11 still monitors the whole rail for stall detection. Seven servos then land on *one* `aux` node instead of being smeared across three, and `servo_rc` channels bind to PCA9685 outputs with no change to anything in §3. This is the single highest-value cheap addition to the design.
+**PC13 is also not the only option.** Aditya, 2026-09-07: *"the i2c pins can be repurposed as gpio
+if the lsm6dtr is not used — didnt think that one out i think desoldering it works though. i2c
+fallback gpio expansion is always an option."* So per-node I/O is a **trade**, not a fixed budget:
+
+| Keep | Give up | Gain |
+|---|---|---|
+| I²C on PB8/PB9 | those pins as GPIO | IMU, ToF, I²C encoders, I²C load-cell ADC |
+| PB8/PB9 as GPIO (desolder the LSM6DS3TR-C) | IMU, ToF, all I²C peripherals | 2 free GPIOs |
+| I²C **plus** an expander | nothing | many PWM/GPIO channels on wires that already exist |
+
+The expander stays available for a future node that genuinely needs more channels than v1.0 breaks
+out. It just isn't needed for the servos.
+
+**This is exactly why capabilities are discovered rather than assumed.** Two nodes with identical
+silicon can differ by a desoldering operation, so a node's populated channel list is genuinely
+per-node — read from register 0x080 and the channel `type` registers, never inferred from a part
+number.
 
 ### 9.2 The SimpleFOC driver cannot be driven by v1.0 as specified
 
 A SimpleFOC Mini (DRV8313-class) needs **3 PWM + enable**; the dual driver for the head needs two sets. PC13 cannot provide this.
+
+**This got more urgent, not less.** Aditya, 2026-09-07: each of the two **shoulder nodes carries a GIM 8108-8 on its main axis *and* a SimpleFOC Mini** (one of the two also has a DS3235 servo; the other has spare capacity for load cell / RGB). So `bldc_ext` is not an alternative to the onboard FOC axis — it is an **addition to it, on the same node, at the same time**. That is a second commutation path plus I²C feedback polling on a core already running a 30 kHz FOC ISR: a CPU question as much as a flash question.
 
 There is a *candidate* path: **PB13/PB14/PB15**, exposed as the SPI2 expansion pads, map to **TIM1_CH1N/CH2N/CH3N** — and TIM1 appears free, because FlexNode's motor PWM is on TIM2 (PA0/PA1/PA2). Three hardware PWM channels from one timer is exactly what a Mini wants.
 
@@ -413,7 +499,7 @@ Each step is independently testable, and nothing here requires a motor to turn.
 
 1. **10 BLDC actuators vs 13 nodes** — what are the other three? Changes the profile mix, not the protocol.
 2. **§9.2: how does the head gimbal driver connect?** Own CAN node (preferred), TIM1 on the SPI pads, or deferred to v1.1.
-3. **PCA9685 for servos?** Recommended, cheap, needs a decision before the `aux` node's connector work.
+3. ~~PCA9685 for servos~~ — **closed 2026-09-07.** One servo per node, seven different nodes; PC13's software-timed pulse is sufficient. An I²C expander stays available for a future node that needs more channels than v1.0 breaks out.
 4. **Load-cell ADC part** — NAU7802 recommended; decide when the foot design lands.
 5. **Brainstem MCU** — the site says STM32G0 in one place and STM32G4 in another. G0 has no FDCAN; if the brainstem is to be the realtime bus master in Phase B it must be a G4 (3× FDCAN). Worth settling early, since it determines whether the two-chain topology in §5 is reachable at all.
 6. **Is the Jetson on the CAN bus in production, or only via the brainstem?** Determines whether there are two masters and whether G1's beacon comes from one place or two.
