@@ -393,12 +393,20 @@ Steps 1–7 happen once at boot and cost milliseconds. Nothing in the steady-sta
 
 Writing the channel model made three v1.0 silicon limits concrete. **These are hardware findings, not protocol problems** — the protocol above is correct regardless; what changes is which channels a v1.0 board can actually populate.
 
-### 9.1 One aux output pin, no timer — but this is not the problem it looked like
+### 9.1 One aux output pin — and it can be hardware-timed after all
 
-FlexNode v1.0 brings out **PC13** as its servo/LED output. From the family-0 aux table
-(`fw/moteus_controller.cc:406`), PC13 has **no timer, no ADC, no I²C, no SPI** — a plain
-RTC-domain GPIO, weak (~3 mA) and slow-slewing. So a servo pulse on PC13 must be
-**software-timed**. Workable at 50–330 Hz, but it is not a hardware PWM channel.
+FlexNode v1.0 brings out **PC13** as its servo/LED output. In the family-0 aux table
+(`fw/moteus_controller.cc:406`) PC13 has no timer, no ADC, no I²C and no SPI entry.
+
+> **Correction, 2026-09-07.** An earlier revision reported "PC13 has no timer" as a property of the
+> silicon. **It is not — it is a property of the moteus aux table.** On the G474, `PC_13` maps to
+> **TIM1_CH1N (AF4)** and **TIM8_CH4N (AF6)** (`TARGET_STM32G474xE/.../PeripheralPins.c`). A
+> **hardware-timed** servo pulse is available via **TIM8_CH4N**, which is unclaimed and — unlike
+> TIM1_CH1N — does not collide with the SimpleFOC path in §9.2. Software timing is a fallback, not
+> a requirement.
+>
+> The RTC-domain caveats still stand: PC13 is weak (~3 mA) and slow-slewing. Fine for a servo pulse
+> or a few LEDs; buffer it for long or fast strings.
 
 > **Withdrawn recommendation.** An earlier revision of this section called this a real problem and
 > recommended a **PCA9685** I²C PWM expander to get seven servos onto one node. Aditya, 2026-09-07:
@@ -431,17 +439,55 @@ A SimpleFOC Mini (DRV8313-class) needs **3 PWM + enable**; the dual driver for t
 
 **This got more urgent, not less.** Aditya, 2026-09-07: each of the two **shoulder nodes carries a GIM 8108-8 on its main axis *and* a SimpleFOC Mini** (one of the two also has a DS3235 servo; the other has spare capacity for load cell / RGB). So `bldc_ext` is not an alternative to the onboard FOC axis — it is an **addition to it, on the same node, at the same time**. That is a second commutation path plus I²C feedback polling on a core already running a 30 kHz FOC ISR: a CPU question as much as a flash question.
 
-There is a *candidate* path: **PB13/PB14/PB15**, exposed as the SPI2 expansion pads, map to **TIM1_CH1N/CH2N/CH3N** — and TIM1 appears free, because FlexNode's motor PWM is on TIM2 (PA0/PA1/PA2). Three hardware PWM channels from one timer is exactly what a Mini wants.
+There is a *candidate* path, and it now checks out on paper. **PB13/PB14/PB15** — the SPI2
+expansion pads — map to **TIM1_CH1N (AF6) / CH2N (AF6) / CH3N (AF4)**, confirmed in
+`TARGET_STM32G474xE/.../PeripheralPins.c`. Three hardware PWM channels from one timer is exactly
+what a Mini wants.
 
-**Unverified, and two separate costs:**
+> **Correction, 2026-09-07: FlexNode's motor PWM is on TIM5, not TIM2.** An earlier revision said
+> TIM2. `moteus_hw.h` defaults `pwm1/2/3 = PA_0_ALT0 / PA_1_ALT0 / PA_2_ALT0`, and on the G474 map
+> `PA_x_ALT0` is **TIM5_CHx (AF2)** — plain `PA_x` would be TIM2 (AF1). TIM5 is also the CAN
+> bootloader's time base (`bootloader.h:36`). The conclusion survives, but the reasoning was wrong
+> and would have misled anyone auditing timer allocation.
+
+**Timer allocation, audited.** Claimed: **TIM5** (motor PWM + bootloader), **TIM15** (mbed
+`us_ticker` and `MillisecondTimer`), **LPTIM1** (ADC trigger, `bldc_servo.cc:685`); TIM2/TIM3 only
+if aux1 hardware quadrature is configured; TIM4 only in non-FlexNode families. **Unreferenced and
+therefore free: TIM1, TIM8, TIM16, TIM17, TIM20.**
+
+Four constraints, none fatal but all easy to trip over:
+
+- **`PB_14` is in FlexNode's aux1 pin table** (slot 1, ADC channel 5). It must be configured `kNC`
+  or the aux port and the Mini will fight over it.
+- **CHxN-only drive** needs `CCxNE`/`CCxNP` plus `MOE` — complementary outputs are not enabled by
+  the ordinary channel-enable path.
+- **TIM1's break interrupt shares a vector with TIM15** (`TIM1_BRK_TIM15_IRQn`), which mbed uses.
+  Do not enable TIM1 BRK interrupts.
+- **A shoulder node with both a Mini and a DS3235 cannot put the servo on TIM1_CH1N/PC13** — same
+  channel as PB13. Use **TIM8_CH4N** for the servo, per §9.1.
+
+Pad presence on the CEU6 is still Aditya's netlist to confirm.
+
+**Costs:**
 
 - It consumes the SPI expansion pads. SPI peripherals and the `bldc_ext` channel become mutually exclusive.
-- It needs a **second commutation loop in firmware** — open-loop or a light closed loop against the bound `enc_i2c`, not a second full FOC stack. Real work, real flash, on a board whose first stack has not yet turned a motor.
+- A **second commutation loop** — open-loop or lightly closed against the bound `enc_i2c`, not a
+  second FOC stack. Budgeted at **~10–13 kB** ([flash-budget.md](flash-budget.md)), which now fits
+  comfortably. **Write it separate; share nothing with `bldc_servo`.**
+
+> ⚠ **The CORDIC is a single shared peripheral**, used inside the FOC ISR with a write→read
+> sequence. A main-loop user gets pre-empted mid-transaction and reads someone else's result. The
+> Mini path must use **software sin/cos or a lookup table — never the shared CORDIC.** This is the
+> kind of bug that shows up as rare, unreproducible torque glitches on *both* axes.
+
+- **CPU headroom is unmeasured** — there is no ISR cycle instrumentation. The one available metric
+  is `system_info.idle_rate` (`system_info.cc:75`), readable over SWD now as a delta of
+  `moteus::SystemInfo::idle_count`.
 
 **Decision required.** Three options, in my order of preference:
 
 1. **Head gimbals get their own small MCU and become their own CAN node.** The SimpleFOC dual driver already implies a controller; giving it a CAN interface makes it a peer that speaks the same register protocol. Costs a board, buys total independence, and does not touch FlexNode at all. *If that node speaks classic CAN rather than CAN-FD it cannot share this bus* — a classic-only node errors on FD frames. It must be FD, or it must sit on its own bus.
-2. **`bldc_ext` on TIM1 via the SPI pads,** accepting the loss of SPI expansion and the firmware cost. Verify TIM1 availability and pad breakout on real hardware first.
+2. **`bldc_ext` on TIM1 via the SPI pads,** accepting the loss of SPI expansion and the firmware cost. TIM1 availability is now confirmed in firmware; **pad breakout on the real board is not.** Trace it first.
 3. **Drop `bldc_ext` for v1.0** and revisit on a v1.1 that breaks out a proper 4-pin driver header.
 
 ### 9.3 One I²C bus carries everything

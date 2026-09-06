@@ -7,9 +7,10 @@ short version plus the reasoning traps, which is what a future session actually 
 
 ## The one-line answer
 
-**There is a ~47 KiB hole in the flash map that nothing occupies**, and taking it needs no code
-change at all. Add the measured code levers and it's **≥42 kB without touching the drive path**,
-against 16,848 B free. The flash budget is no longer the constraint on anything.
+**Measured by real variant builds, 2026-09-07 02:40 IST: three changes that never touch the drive
+path total −84,028 B**, taking the image from 437,808 to **353,780 B with 100,876 B free**. Add the
+unused flash gap and the removable drivers and the ceiling is ~150 kB. The flash budget is no
+longer the constraint on anything, including a second commutation path for the SimpleFOC Mini.
 
 ## Finding 1 — the unused gap (the best one, and nearly missed)
 
@@ -71,14 +72,33 @@ about magnitude, the second about dependencies.
 
 ## The levers, ranked
 
-| # | Lever | Bytes | Risk |
+| # | Lever | Measured | Risk |
 |---|---|---|---|
-| 1 | Linker-script gap → move `.rodata*` | **~23 kB now, ~47 kB available** | none, no code change |
-| 2 | `--specs=nano.specs` + **`-u _printf_float` (mandatory)** | 28 kB exposed, saving unmeasured | libc swap only |
-| 3 | `flexnode_nothrow_stubs.cc` — define the five `std::__throw_*` as `[[noreturn]]` traps | 11,357 B ceiling | none; behaviour under `-fno-exceptions` is terminate anyway |
-| 4 | iC-PZ 6,637 · UART `kSerial` 5,917 · BiSS-C 3,832 · quadrature 1,816 · MA732 1,040 | **19,242 B measured** | off drive path; BiSS-C has a 1,056 B CCM ISR |
-| 5 | `Ws2812Led::Status` telemetry | 4,524 B | ours, trivial |
+| 1 | **newlib-nano** + `-Wl,-u,_printf_float` | **−33,916 B** | none; 2 lines in `fw/BUILD` |
+| 2 | Linker-script gap → move `.rodata*` | ~23 kB now, **48,680 B** available | none, no code change |
+| 3 | `flexnode_nothrow_stubs.cc` — five `std::__throw_*` as `[[noreturn]]` traps | **−12,316 B** | none; behaviour under `-fno-exceptions` is terminate anyway |
+| 4 | `moteus_controller.cc` at `-Os` | **−50,144 B** | ⚠ link-order-fragile, see below |
+| **1+3+4** | **combined** | **−84,028 B → 100,876 B free** | as 4 |
+| 5 | iC-PZ 6,637 · UART `kSerial` 5,917 · BiSS-C 3,832 · quadrature 1,816 · MA732 1,040 | **19,242 B** | off drive path; BiSS-C has a 1,056 B CCM ISR |
+| — | fw-wide `-Os` | **does not compile** (`bldc_servo_control.h:1137` section type conflict) | moot |
 | — | FOC stack for motor-less nodes (`bldc_servo.o` 104.5 kB) | large | **motor path — not before hardware validation** |
+
+> Gotcha, 2026-09-07 02:40 IST: **most of the apparent "driver bloat" is `-O3` inlining, not driver
+> code.** Under `-Os`, `AuxPort::HandleConfigUpdate` drops 13,636 → 4,788 and
+> `AuxStatus::Serialize<BinarySchemaArchive>` drops 4,764 → 604. That is why lever 4 out-earns
+> deleting drivers entirely — and why the original "cut the unused encoders" instinct was chasing
+> a symptom.
+
+> Gotcha, 2026-09-07 02:40 IST: lever 4's safety is **link-order-dependent and fragile.** The big
+> CCM ISR bodies came out byte-identical only because they are COMDAT (`W`) symbols also emitted
+> by `bldc_servo.o`, whose `-O3` copies win by link order. Small aux ISR helpers that exist *only*
+> in the controller TU did change — including `Stm32Spi::start_write`/`finish_write`, the AS5047
+> SPI transfer in the position ISR. **Scope the pragma (`push_options`) or split the TU; never
+> apply TU-wide `-Os` and assume the link order holds.**
+
+> Gotcha, 2026-09-07 02:40 IST: **`-Wl,-u,_printf_float` is mandatory with nano.** Without it the
+> image is 4,880 B *smaller* and floats print wrong — a silent correctness bug, not a build error.
+> `conf get`, `tel get`, `moteus_tool --dump-config/--restore-config` and tview all consume `%g`.
 
 ## Do not chase
 
@@ -87,10 +107,10 @@ about magnitude, the second about dependencies.
   **Unreclaimable.**
 - `drv8323.o` 33,160 B, `board_debug.o` 13,568 B, `motor_position.h`, `bldc_servo.o` — ⚠ all
   drive/position path.
-- `moteus_controller.o` at `-Os` looks tempting (129.5 kB at `-O3`) but that TU **instantiates CCM
-  ISRs** (`ISR_UpdateSources`, `ISR_MaybeFinishSample`, `ISR_I2C_Update`). A TU-wide `-Os` slows
-  the position-sampling ISR. ⚠ Review required.
 - **No LTO.** Not near ISRs and weak symbols on a board that has not turned a motor.
+
+(`moteus_controller.o` at `-Os` is **not** on this list — it is lever 4 and the single biggest
+measured win. It belongs in the ranked table with its link-order caveat, not here.)
 
 ## Recipe to re-measure
 

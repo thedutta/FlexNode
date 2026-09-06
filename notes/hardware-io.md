@@ -13,13 +13,21 @@ _Recorded 2026-09-07 01:35 IST, from `fw/moteus_controller.cc:401-500` (family-0
 | Resource | Pins | Peripheral backing | Notes |
 |---|---|---|---|
 | I²C1 | PB8 / PB9 | `I2C1`, `USART3` alt | aux2. Onboard LSM6DS3TR-C (0x6A) + VL53L7CX (DNP) + J2 external port. 2 kΩ pull-ups |
-| Servo / LED out | PC13 | **nothing** | aux1 pin 0. No timer, no ADC, no I²C, no SPI |
+| Servo / LED out | PC13 | **TIM1_CH1N (AF4), TIM8_CH4N (AF6)** | aux1 pin 0. No *aux-table* timer, but the silicon has two |
 | SPI2 pads | PB13 / PB14 / PB15 | `SPI2`, ADC | aux1 pins 1–3. Also ADC-capable |
 | 5 V rail sense | PB11 | ADC | 50 mΩ high-side shunt, ~32 mA/LSB |
 | ToF INT | PB10 | EXTI | |
 | Debug / GPIO | PC14 / PC15 | nothing | aux2 pins 2–3 |
 | WS2812 | PF0 | bit-banged, DWT-timed | status LED, see [`ws2812-led.md`](ws2812-led.md) |
 | Rotor encoder | PC6 (CS) | SPI1 | AS5047P, **not yet soldered** |
+
+> Gotcha, 2026-09-07 02:40 IST: **"PC13 has no timer" is false as a hardware claim** — I recorded
+> it that way earlier. It has no timer *in the moteus aux table*. The G474 maps `PC_13` to
+> **TIM1_CH1N (AF4)** and **TIM8_CH4N (AF6)** (`TARGET_STM32G474xE/.../PeripheralPins.c`), so a
+> **hardware-timed servo pulse via TIM8_CH4N** is available — and TIM8_CH4N is the right choice
+> over TIM1_CH1N because TIM1 is wanted for the SimpleFOC Mini below. The RTC-domain drive
+> caveats (weak ~3 mA, slow slew) still stand. Lesson: an absent entry in a vendor table is not an
+> absent capability in the silicon.
 
 > Gotcha, 2026-09-07 01:35 IST: **the aux hardware tables are still stock moteus r4 pinouts.**
 > `GetAux1HardwareConfig()` / `GetAux2HardwareConfig()` in `fw/moteus_controller.cc` were never
@@ -44,9 +52,10 @@ was **spaced deliberately from the beginning** so no node is overloaded:
 
 > Gotcha, 2026-09-07 01:35 IST: I initially recommended a **PCA9685 I²C PWM expander** to solve
 > "seven servos, one pulse pin". **That recommendation was wrong and is withdrawn** — it solved a
-> problem that does not exist, because the servos were never going to share a node. PC13's single
-> software-timed pulse is sufficient *per node*. The lesson is to ask how the mechanical layout is
-> actually distributed before optimising a per-node resource.
+> problem that does not exist, because the servos were never going to share a node. One pulse on
+> PC13 is sufficient *per node* — and per the correction above it can even be hardware-timed via
+> TIM8_CH4N. The lesson is to ask how the mechanical layout distributes load before optimising a
+> per-node resource.
 
 ## The trades available
 
@@ -76,17 +85,46 @@ assumed from a part number.
 the shoulder nodes need it *simultaneously with* their own GIM 8108-8 on the main axis — so this
 is not an either/or with the onboard FOC, it is an addition to it.
 
-Candidate path: **PB13/PB14/PB15 → TIM1_CH1N/CH2N/CH3N.** TIM1 looks free because FlexNode's motor
-PWM is on TIM2 (PA0/PA1/PA2 via the `_ALT0` mappings in `fw/moteus_hw.cc:71-72`). If that holds,
-three hardware PWM channels from one timer is exactly what a Mini wants.
+Candidate path: **PB13/PB14/PB15 → TIM1_CH1N (AF6) / CH2N (AF6) / CH3N (AF4)**, confirmed in
+`TARGET_STM32G474xE/.../PeripheralPins.c`. Three hardware PWM channels from one timer is exactly
+what a Mini wants.
 
-Unverified, and it costs:
+> Gotcha, 2026-09-07 02:40 IST: **motor PWM is on TIM5, not TIM2.** I recorded TIM2 earlier and it
+> was wrong. `moteus_hw.h` defaults `pwm1/2/3 = PA_0_ALT0 / PA_1_ALT0 / PA_2_ALT0`; on the G474
+> map `PA_x_ALT0` is **TIM5_CHx (AF2)** — plain `PA_x` would have been TIM2 (AF1). TIM5 is also the
+> CAN bootloader's time base. The conclusion (TIM1 is free) survives; the reasoning did not.
+
+**Timer allocation, audited 2026-09-07 02:40 IST.** Claimed: **TIM5** (motor PWM + bootloader),
+**TIM15** (mbed `us_ticker` + `MillisecondTimer`), **LPTIM1** (ADC trigger, `bldc_servo.cc:685`);
+TIM2/TIM3 only if aux1 hardware quadrature is configured; TIM4 only in non-FlexNode families.
+**Free: TIM1, TIM8, TIM16, TIM17, TIM20.**
+
+Four constraints on the TIM1 path, none fatal, all easy to trip over:
+- **`PB_14` is in FlexNode's aux1 pin table** (slot 1, ADC ch5) — must be `kNC` or aux and the Mini
+  fight over it.
+- **CHxN-only drive needs `CCxNE`/`CCxNP` + `MOE`** — complementary outputs are not enabled by the
+  ordinary channel-enable path.
+- **TIM1 BRK shares a vector with TIM15** (`TIM1_BRK_TIM15_IRQn`), which mbed uses. Don't enable
+  TIM1 break interrupts.
+- **A shoulder node with both a Mini and a DS3235 cannot put the servo on TIM1_CH1N/PC13** — same
+  channel as PB13. Use **TIM8_CH4N** for the servo.
+
+Costs:
 - the SPI expansion pads (SPI peripherals and an external BLDC become mutually exclusive);
 - a **second commutation path in firmware** — open-loop or lightly closed against an I²C
-  AS5600/MT6701, not a second full FOC stack;
-- **CPU**, on a core already running a 30 kHz FOC ISR.
+  AS5600/MT6701, not a second FOC stack. Budgeted **~10–13 kB**, which now fits easily. **Write it
+  separate; share nothing with `bldc_servo`.**
+- **CPU**, on a core already running a 30 kHz FOC ISR. **Headroom unmeasured** — no ISR cycle
+  instrumentation exists. Only metric: `system_info.idle_rate` (`system_info.cc:75`), readable over
+  SWD as a delta of `moteus::SystemInfo::idle_count`.
 
-Under investigation as of 2026-09-07 01:35 IST. Three options and their trade-offs are written up
+> Gotcha, 2026-09-07 02:40 IST: **the CORDIC is a single shared peripheral**, used inside the FOC
+> ISR with a write→read sequence. A main-loop user gets pre-empted mid-transaction and reads
+> someone else's result. A Mini commutation path must use **software sin/cos or a LUT — never the
+> shared CORDIC.** Failure mode would be rare unreproducible torque glitches on *both* axes, which
+> is close to the worst thing to debug on this machine.
+
+Firmware-side availability confirmed 2026-09-07 02:40 IST; **pad breakout on the real board is not** — trace it. Three options and their trade-offs are written up
 in [`../docs/can-layer.md`](../docs/can-layer.md) §9.2. Nothing should be committed to a v1.1
 board revision until TIM1 availability and the PB13/14/15 breakout are confirmed on real hardware.
 
