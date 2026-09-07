@@ -79,3 +79,33 @@ Bench photos: one first-light photo is live. More can go in as milestones land. 
 - **G2 deputy is the most dangerous idea in the design.** A node that can command its peers can do
   so while wrong. Whitelist (reducing actions only), authority expiry, and default-off rank are
   what make it survivable. Do not relax any of the three for convenience. docs/can-layer.md §7.
+
+## 9. CAN physical layer — action item found 2026-09-08 02:30 IST
+**Enable TDC before running a real bus.** `fw/moteus.cc:224` disables Transmitter Delay
+Compensation for family 0 (`delay_compensation = g_measured_hw_family != 0`) on the grounds that
+the TCAN334G has "very low loop delay". Measured against the datasheet that is a **6 ns margin**:
+the firmware's 5 Mbit sample point is 141 ns, the TCAN334G worst-case loop delay is 135 ns
+well-terminated and **180 ns heavily loaded** — i.e. negative margin on a loaded or
+single-terminated bus.
+
+> Gotcha: this is exactly the class of bug that never shows on the bench and then produces
+> intermittent 5 Mbit errors on the assembled robot. It works with `bitrate_switch` off and fails
+> with it on — remember that as the diagnostic. Thousands of moteus r4.x boards run this way on
+> typical parts, which is why it has never surfaced upstream; do not rely on typicals.
+
+Fix: `options.delay_compensation = true`, keep `tdc_offset = 13`, `tdc_filter = 2`. Two lines, on a
+code path other moteus families already exercise. Turns 6 ns into ~150 ns.
+Also recommended: sample points **80 % nominal / 76.5 % data** vs the 67 % / 71 % that
+`MakeTime`'s 3:1 split programs today (`fw/fdcan.cc:44-72`). `ApplyRateOverride` already exists but
+the `Rate` struct is not exposed as `can.*` config — small firmware addition.
+**Every node and the corenode must use identical timing.**
+
+Full analysis: `reports/2026-09-08-can-subsystem-design.md` §2.
+
+## 10. Three [measure] items gating the CAN design (2026-09-08)
+All need an adapter (or the serial route in §3):
+- **Node reply turnaround.** CAN RX is polled from the main loop (`fw/moteus.cc:348`), so reply
+  latency is unknown and the whole 1.95 ms cycle model rests on it. Measure first.
+- **5 Mbit error counters, TDC on vs off,** over a thermal warm-up (no HSE crystal — the 85 MHz
+  derives from HSI16 at +/-1 %).
+- **Real cycle time** vs the model.

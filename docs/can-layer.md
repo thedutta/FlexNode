@@ -2,6 +2,10 @@
 
 _v2, 2026-09-07. Supersedes the v1 design of 2026-07-21 (the v1 register block 0x080–0x0FF is retained verbatim — see [§4](#4-the-node-block-0x0800x0ff-v1-retained)). Companion to [firmware.md](firmware.md), [hardware.md](hardware.md), [roadmap.md](roadmap.md)._
 
+> **The CATBOT instantiation of this spec is `reports/2026-09-08-can-subsystem-design.md`** —
+> physical layer, per-node frame layouts, the 350 Hz operating point, and the failure policy, worked
+> to near-buildable detail for the real 10-node fleet. Where the two differ, that report is newer.
+
 **Status:** design. Implemented today: node block 0x080/0x081, IMU 0x098–0x09F, pixel 0x0B0–0x0B4, version 0x0FF. Everything in [§3](#3-the-channel-model) and [§7](#7-host-loss-and-inter-node-autonomy) is unbuilt. **Nothing in this document has been exercised over a real CAN bus** — there is no adapter on the bench yet.
 
 ---
@@ -27,7 +31,12 @@ Two properties follow from that, and they drive every decision below:
 
 ### Scope note on node count
 
-The published CATBOT actuator list is 4× GIM8108-8 hips + 6× 5010 knees (BLDC, one FlexNode each) + 2 head gimbals on a SimpleFOC dual driver + 7 DS3235/DS3230 servos on node aux ports = 19 DoF but only **10 BLDC actuators**. The "thirteen nodes" figure elsewhere is therefore 10 actuator nodes + ~3 non-actuator nodes (servo/sensor duty). This document assumes 10 + 3 and sizes the bus for 13. **Flagged as unreconciled** — the split changes the profile mix in [§6](#6-profiles-build-time-roles), not the protocol.
+**The fleet is 10 FlexNodes** (Aditya, 2026-09-08 — this closes the earlier 10-vs-13 ambiguity).
+Every node has its own BLDC FOC actuator on axis 0; some additionally carry a servo, some a servo
+*and* a SimpleFOC Mini, some other effectors. That per-node variation is exactly what the channel
+model exists to express. The **corenode is the bus master**; the Jetson sits behind it running the
+neural policy. `aux` and `sense` profiles are therefore **not used on CATBOT** — every node is a
+`full`-class node.
 
 ---
 
@@ -121,6 +130,11 @@ Every channel of every type has the same ten core registers:
   4 B / 12 B for the full four. Per node per cycle that is often a whole DLC step (§5.2), which is
   why every type puts its loop-critical pair in `meas_a`/`meas_b`
 
+**The fast pair is the contract.** Per cycle a channel is commanded with `cmd_a, cmd_b` and read
+back with `meas_a, meas_b` — two registers each way, one subframe each way. `cmd_c` and
+`meas_c`/`meas_d` are **slow-lane only**. This is what makes a three-effector node fit under a DLC
+boundary; see the frame layouts in `reports/2026-09-08-can-subsystem-design.md`.
+
 So a node with two active channels adds roughly `2 × (3 + 3·2)` command bytes and `2 × (3 + 4·2)` reply bytes to its frame — about 18 and 22 bytes. That is affordable at gait rate; [§5](#5-cadence-and-bus-budget) does the arithmetic.
 
 ### 3.4 Type-specific bindings
@@ -129,7 +143,7 @@ Only the interpretation changes; the frame does not.
 
 | Type | `cmd_a` | `cmd_b` | `cmd_c` | `meas_a` | `meas_b` | `meas_c` | `meas_d` |
 |---|---|---|---|---|---|---|---|
-| `servo_rc` | angle ° | slew °/s | — | angle ° (from bound encoder) | °/s | 5 V current A | — |
+| `servo_rc` | angle ° | slew °/s | — | angle ° (from bound encoder) | **5 V current A** | °/s | — |
 | `bldc_ext` | position rev | velocity rev/s | current limit A | position rev | velocity rev/s | current A | driver temp |
 | `enc_i2c` | — | — | — | angle ° | °/s | — | magnet AGC / health |
 | `loadcell` | — | — | — | force (scaled) | **contact flag** | raw counts | d/dt |
@@ -229,7 +243,9 @@ same moment, one refusal.
 
 Unchanged in principle from v1, extended to channels:
 
-- **Fast lane, every cycle:** per node, one frame carrying command + query. Contains the stock axis command (`0x000`, `0x020`–`0x022`), the stock axis query (`0x000`–`0x003`, `0x00D`–`0x00F`), plus each *fast* channel's command and readback subframes.
+- **Fast lane, every cycle:** per node, one frame carrying command + query. Contains the stock axis command (`0x000`, `0x020`–`0x022`), the stock axis query (**`0x000`–`0x003` only** — `0x00D`–`0x00F` voltage/temp/fault moved to the slow lane to stay under a DLC boundary), plus each fast channel's `cmd_a/cmd_b` and `meas_a/meas_b` subframes.
+- **The fast lane is not a rotation.** Every node is commanded and queried **every cycle, in id order** — an actuator command cannot be round-robined without the joint going stale. Starvation is impossible by construction. Only the slow lane rotates.
+- **Two commands in flight, maximum.** This bounds latency and sidesteps an arbitration quirk: corenode commands win against replies from ids 1–7 but *lose* to replies from ids ≥ 8.
 - **Slow lane, rotating:** one node per cycle additionally reads its full channel set, node header, and health. At 13 nodes and 325 Hz that is a **25 Hz refresh per node** — ample for IMU bias tracking, ToF, rail current and diagnostics.
 - **Fire-and-forget:** pixel writes, tare commands, servo re-arm. No reply bit, dropped into idle slots.
 - **Promotion is free.** Moving a channel from slow to fast is a host-side schedule change. Firmware is untouched.
@@ -273,6 +289,10 @@ timing with DLC quantisation applied.
 | 13 nodes, axis + 2 fast channels, 325 Hz | **~97 %** ✗ | 75 % |
 | 2 chains × 7, axis + 2 fast channels, 400 Hz | ~65 % ⚠ | 52 % |
 | 2 chains × 7, axis + 2 fast channels, 1 kHz | ✗✗ | 130 % |
+
+**Operating point for the real 10-node fleet** (worked in `reports/2026-09-08-can-subsystem-design.md`):
+per-node round trip 154–195 µs by class, cycle ≈ 1.95 ms, ceiling **513 Hz**, usable 330–385 Hz.
+**Recommended: 350 Hz at ≈68 % utilisation.** Bring up at 200 Hz, walk at 300 Hz.
 
 **Rules that fall out of this table — unchanged in direction, sharper in degree:**
 
@@ -339,6 +359,9 @@ Ordered levers, with measured bytes:
 
 **Realistic total without going near the drive path: ≥42 kB**, against 16,848 B free today.
 
+**Profiles are off CATBOT's critical path.** All 10 nodes are `full`-class; profiles remain a
+product feature, not a CATBOT build step.
+
 Also measured, and worth knowing even though the droppable subset is small: **18 % of the image
 (79,518 B) is mjlib serialisation boilerplate** — every `PersistentConfig` / `TelemetryManager`
 registration costs 2–8 kB. The tell was `ws2812_led.o` at 13.8 kB for a driver whose logic is
@@ -397,7 +420,12 @@ Nodes need no changes to accept this: moteus does not inspect the source field, 
 - It is the single documented exception to poll-response, bounded by a timeout, an authority expiry, and a whitelist. The invariant is *scoped*, not abandoned.
 - Ordinary bus load: **zero**. G2 transmits only when the fleet is already in a failure state.
 
-> Build G0 now (it is free), G1 when the brainstem firmware exists, G2 only once CATBOT actually stands. **G2 is the most dangerous idea in this document** — a node that can command its peers is a node that can command its peers when it is *wrong*. The whitelist and the expiry are what make it survivable, and neither should ever be relaxed for convenience.
+> **For CATBOT specifically, G2 should not be built.** With the corenode as the only master it is
+> the predictable failure tier, and G0's damped sag (`kZeroVelocity` within a **30 ms**
+> `default_timeout_s`) is a defensible outcome for a machine this size. G1 collapses into "the fast
+> lane *is* the heartbeat", plus a fleet-state broadcast for **Jetson** loss rather than corenode
+> loss. G2 stays documented as a product capability and an option for larger fleets — build G0 now,
+> G1 with the corenode firmware, and G2 only if something later actually justifies it. **G2 is the most dangerous idea in this document** — a node that can command its peers is a node that can command its peers when it is *wrong*. The whitelist and the expiry are what make it survivable, and neither should ever be relaxed for convenience.
 
 ### Time sync
 
@@ -537,6 +565,35 @@ IMU + ToF + every I²C encoder + a load-cell ADC + a possible PCA9685 all share 
 
 **Choose I²C parts to keep this bus short:** prefer **NAU7802** (I²C, 24-bit) for load cells over HX711 (2-wire bit-bang, needs two GPIOs that v1.0 does not have to spare) and over ADS1220 (SPI, contends with the same pads as §9.2).
 
+### 9.5 Physical layer — 45 cm, and one latent bug
+
+Worked in full in `reports/2026-09-08-can-subsystem-design.md` §2. The essentials:
+
+**Length is not a constraint.** 45 cm end-to-end is ~2.3 ns of propagation against a 1 µs
+arbitration bit and a 200 ns data bit. Arbitration would survive to **30–40 m** at 1 Mbit; the
+5 Mbit data phase is limited by ringing rather than propagation and wants **< ~1 m total with stubs
+under ~30 cm**. CATBOT is comfortably inside both.
+
+**Chain, not star** — though a star would actually work electrically at this length (stub round
+trips ≈ 2 ns against a 17 ns transceiver edge). Daisy-chain wins on termination clarity, the
+existing J3/J4 connectors, and wire mass. **Terminate the two physical ends only:** a terminated
+middle node costs dominant amplitude; a single terminated end doubles the recessive-edge time
+constant and starts failing 5 Mbit bit symmetry intermittently — diagnosable because it works with
+`bitrate_switch` off and fails with it on.
+
+> ⚠️ **Latent bug: Transmitter Delay Compensation is disabled for family 0**
+> (`fw/moteus.cc:224`, `delay_compensation = g_measured_hw_family != 0`, on the grounds that the
+> TCAN334G has "very low loop delay"). The firmware's own 5 Mbit sample point is **141 ns**; the
+> TCAN334G datasheet worst-case loop delay is **135 ns** well-terminated and **180 ns** heavily
+> loaded. That is a **6 ns margin — and negative on a loaded or single-terminated bus.** Thousands
+> of moteus boards clearly run on typical parts, but the design should not depend on typicals.
+>
+> **Fix: enable TDC** (`options.delay_compensation = true`, keep `tdc_offset = 13`,
+> `tdc_filter = 2`) — a two-line change on an already-exercised code path that turns 6 ns into
+> ~150 ns. Recommended alongside: sample points of **80 % nominal / 76.5 % data**, against the
+> 67 % / 71 % that `MakeTime`'s 3:1 split programs today. Every node and the corenode must use
+> identical settings.
+
 ### 9.4 ToF firmware blob
 
 Unchanged from v1 and still the right answer: the VL53L7CX/L5CX needs an ~84 KB blob at every power-on. It cannot live in node flash. The host streams it over the **diagnostic tunnel** at boot and the node forwards it over I²C. Zero flash cost; ToF only initialises when a host is present, which is acceptable because ToF is useless without one. **Bench-validate tunnel throughput before committing** — 84 KB over the tunnel at gait-rate scheduling could take an unpleasantly long time, and thirteen nodes doing it serially at boot could be minutes.
@@ -581,9 +638,12 @@ Each step is independently testable, and nothing here requires a motor to turn.
 
 ## 12. Open questions
 
-1. **10 BLDC actuators vs 13 nodes** — what are the other three? Changes the profile mix, not the protocol.
+1. ~~10 BLDC actuators vs 13 nodes~~ — **closed 2026-09-08: the fleet is 10**, all with axis 0.
 2. **§9.2: how does the head gimbal driver connect?** Own CAN node (preferred), TIM1 on the SPI pads, or deferred to v1.1.
 3. ~~PCA9685 for servos~~ — **closed 2026-09-07.** One servo per node, seven different nodes; PC13's software-timed pulse is sufficient. An I²C expander stays available for a future node that needs more channels than v1.0 breaks out.
 4. **Load-cell ADC part** — NAU7802 recommended; decide when the foot design lands.
-5. **Brainstem MCU** — the site says STM32G0 in one place and STM32G4 in another. G0 has no FDCAN; if the brainstem is to be the realtime bus master in Phase B it must be a G4 (3× FDCAN). Worth settling early, since it determines whether the two-chain topology in §5 is reachable at all.
+5. **Corenode MCU** — partly closed: **a G0 cannot be the corenode**, because it has no FDCAN at all. The corenode must be FDCAN-capable (a G4 has 3×, which is also the two-chain upgrade path). What silicon the corenode actually is remains Aditya's to confirm.
+7. **[measure] Node reply turnaround** — CAN RX is polled from the main loop (`fw/moteus.cc:348`), so reply latency is not yet known and the 1.95 ms cycle model depends on it. First thing to measure once an adapter exists.
+8. **[measure] 5 Mbit error counters** with TDC on and off, over a warm-up — see §9.5.
+9. **[measure] Real cycle time** against the 1.95 ms model.
 6. **Is the Jetson on the CAN bus in production, or only via the brainstem?** Determines whether there are two masters and whether G1's beacon comes from one place or two.
