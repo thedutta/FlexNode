@@ -14,6 +14,7 @@ Working notes for the FlexNode firmware and bench, kept so that each new session
 | [`firmware-map.md`](firmware-map.md) | Where things live in the fork, how to add a register / an aux I²C device / a config group |
 | [`bringup-log.md`](bringup-log.md) | Chronological record of what was validated when, and the remaining hard gates |
 | [`hardware-io.md`](hardware-io.md) | What I/O the board actually has, per-node peripheral assignment, and the trades available |
+| [`corenode.md`](corenode.md) | Corenode architecture: two-FDCAN split, its own IMU, the IMU-ODR latency finding, pre-schematic snags |
 | [`can-layer-design.md`](can-layer-design.md) | Why the CAN layer is shaped the way it is — decisions and the reasoning behind them |
 | [`flash-findings.md`](flash-findings.md) | Where the flash actually went, measured. Overturns an earlier assumption |
 | [`open-questions.md`](open-questions.md) | Decisions still pending: CAN adapter, encoder, head-gimbal topology, node count |
