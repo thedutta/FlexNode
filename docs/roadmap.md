@@ -1,8 +1,8 @@
 # FlexNode — Roadmap & Status
 
-_Last updated: 2026-09-06 (first article booted and flashed; WS2812 status/lighting driver live; IMU verified; register-block skeleton in)_
+_Last updated: 2026-09-08 (first spin: power stage and sensing validated open-loop; CAN layer v2 and flash budget measured)_
 
-FlexNode v1.0 **booted for the first time on 2026-09-06**: a board on a 13 V bench adapter, flashed over SWD, running the FlexNode firmware with a live status LED. Validated so far: power tree, MCU boot from flash, SWD/flash toolchain, PF0 → WS2812B, moteus main loop. Everything below that is still unvalidated — no motor and no encoder are fitted, and the gate driver has never been energized.
+FlexNode v1.0 **booted for the first time on 2026-09-06** and **drove a motor for the first time on 2026-09-08**: a GIM 8108-8 turning open-loop from a current-limited 13 V / 1 A supply, on a throwaway bench image (`bench/openloop-test`). Validated on hardware so far: power tree, boot from flash, SWD/flash toolchain, WS2812B status LED, LSM6DS3TR-C IMU, DRV8353S enable, six-FET power stage under load, all three phase-current channels, bus-voltage sense against a DMM, FET thermistor, and the bus-sag abort path. **Not yet:** the encoder is unsoldered, so no closed-loop FOC, calibration or position control has run; the phase-order fix is unverified (open-loop drive cannot test it); CAN has never been exercised. Details in [`notes/bringup-log.md`](../notes/bringup-log.md).
 
 ## Hardware
 
@@ -14,7 +14,7 @@ FlexNode v1.0 **booted for the first time on 2026-09-06**: a board on a 13 V ben
 - [x] Gerbers + pick-and-place exported; boards ordered
 - [x] PCBA / assembly — first article built (encoder not yet soldered)
 - [x] Power-on smoke test — 13 V bench adapter, 5 V buck and 3.3 V logic rail stable, no heating
-- [ ] Gate-driver + FET bring-up, current-sense calibration (not energized yet)
+- [x] Gate-driver + FET bring-up, current-sense calibration — open-loop first spin 2026-09-08 (bench branch); closed-loop and phase-order check still pending on the encoder
 
 ## Firmware
 
@@ -36,7 +36,8 @@ FlexNode v1.0 **booted for the first time on 2026-09-06**: a board on a 13 V ben
 - [ ] ToF init-blob streaming over the diagnostic tunnel (~84 KB, can't live in flash) + summary registers
 - [x] Confirm `nBOOT0` option byte = boot-from-flash — `nSWBOOT0` cleared so the I²C pull-up on PB8/BOOT0 cannot force the bootloader
 - [ ] First-article flash-write / config-persist validation (`0x0807f000` write + power-cycle)
-- [ ] CAN enumeration + telemetry; `bus_V` vs DMM check (validates the as-built R30 rescale)
+- [x] `bus_V` vs DMM check — 2026-09-08, 12.82 V vs 12.50 V, `vsense_adc_scale` trimmed on the bench branch (port to `main` pending)
+- [ ] CAN enumeration + telemetry (needs a CAN-FD adapter)
 
 ## System (CATBOT integration)
 

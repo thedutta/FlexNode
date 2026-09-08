@@ -22,21 +22,12 @@ Board on a 13 V bench adapter; 5 V and 3.3 V rails stable.
 
 Image at end of day: 437,808 B, ~16 KiB free.
 
-## Still gated (as of 2026-09-06)
-| Gate | Status | What unblocks it |
-|---|---|---|
-| CAN enumeration, telemetry, register block over the wire | not started | a CAN-FD adapter (fdcanusb or CANable-FD) |
-| `bus_V` vs DMM (validates the R30 rescale) | not started | same adapter (`servo_stats.bus_V` over CAN) |
-| Encoder bring-up on PC6 | not started | AS5047 soldered to the back side |
-| Config-write path (0x0807F000) survives power cycle | not started | `conf write` over CAN, then power cycle |
-| **Phase-order validation** | not started | current-limited supply, `moteus_tool --calibrate`, watch convergence and phase currents. **Hard gate before any motor drive.** |
-| Bring-up config: `servo.max_current_A` 25–30, `servo.vds_lvl_mv` 100–200, `servo.max_voltage` ≈ 38 (8S) | not applied | CAN |
-| Gate-drive currents for BSC016N06NS (inherited r4.11) | untested | first spin, watch edges/EMI |
+(The "still gated" table that stood here as of 2026-09-06 is superseded by the one at the end of the file.)
 
-## 2026-09-07 02:20 IST — open-loop motor test image prepared (NOT YET RUN)
+## 2026-09-07 02:20 IST — open-loop motor test image prepared
 
-First-energisation bench image built on branch `bench/openloop-test`, commit `843566b`. **Not on
-main, not pushed, and not yet flashed or run.** The power stage has still never been energised.
+First-energisation bench image built on branch `bench/openloop-test`, commit `843566b`. Not on
+main. At the time of writing the power stage had never been energised; the runs are in the next entry.
 
 Motor GIM 8108-8, no encoder (AS5047 unsoldered, magnets not arrived), 13 V 1 A current-limited
 supply. Uses stock `kVoltageFoc` (mode 7) — commanded electrical angle + voltage, sinusoidal, **no
@@ -75,7 +66,33 @@ word 0 must read `b3ac0001`.
 Known-good image preserved at `tools/bench/out-good/` (md5-verified against the ef0d948 build) so
 the working firmware can always be restored.
 
-Still unvalidated: `bus_V` has never been checked against a DMM (a refusal with bus-range reason
-would be the first sign the R30 rescale is wrong); the DRV8353 has never been enabled and its
-gate-drive currents are inherited r4.11 values for different FETs; reading RAM without halting via
-this ST-Link clone is untested.
+Unvalidated at the time: `bus_V` against a DMM, the DRV8353 enable, and reading RAM without halting
+via this ST-Link clone. All three were closed on 2026-09-07/08 — next entry.
+
+## 2026-09-07 → 2026-09-08 — first spin (branch `bench/openloop-test`, `843566b` → `0e29bad`)
+
+Recorded 2026-09-08 13:20 IST from the bench-branch commit messages and the STAGE CONSTANTS block of `flexnode_bench_openloop.cc`; the test images stay on the branch and `main` is unchanged. Motor GIM 8108-8 (8:1 output), no encoder, 13 V adapter whose current limit measured at 1.03 A. Open-loop `kVoltageFoc` through the stock `BldcServo::Command()` path — FOC / PWM / current-sense / gate-driver code untouched.
+
+- First run (2026-09-07) aborted at the end of the countdown on a **false** overcurrent: the DRV8353 CSA outputs sit at 0 V while the driver sleeps and moteus calibrates offsets only after enable. Fix `8f28710`: current checks gated on `servo_mode == kVoltageFoc`, new `kSensorInvalid` class. Bus 12.4–12.5 V and FET 31.9 °C read correctly from boot.
+- **DRV8353S enabled; the power stage switched; the motor turned.** Run 2 (0.30 V, 0.1 rev/s) moved the output 103/104° per movement as designed, 1,047 mA measured vs ~1.0 A modelled after the dead-time loss.
+- **Phase-current sense validated**: all three offsets calibrate once the driver is enabled; phase currents sum to ~0 (the `kSensorInvalid` check depends on it). V–I points fit R ≈ 0.364 Ω/phase, V_dt ≈ 30 mV (honest range 0.33–0.44 Ω; the stage-1/2 predictions had halved the datasheet R — `40a25a6`).
+- **Stage 2** (1.33 V / 0.8 rev/s, `9ef8d20`): **8 loops, 140 s energised, zero faults, FET plateau 38.7 °C.** Forward half-sine 4.5 s, reverse square 2.875 s.
+- **Stage 3** (3.325 V / 2.0 rev/s, `40a25a6`) sag-aborted at the 1.8 V sweep step exactly as modelled (4.83 A, 12.9 W, 1.03 A; adapter collapsed 12.57 → 10.46 V). **The bus-sag abort works and de-energises cleanly.** Stage 3 waits for a bigger supply; stage 2R (`0e29bad`) rolls the drive back to stage-2 parameters.
+- **`bus_V` vs DMM done** (over SWD telemetry, not CAN): DMM 12.82 V vs board 12.50 V (12.64 V running max) → ratio 1.0145–1.0255, midpoint applied: `vsense_adc_scale` 0.067944 → 0.069540 (bench branch only so far). The R30 rescale was right to ~2.5 %.
+- V–I sweep segment (`7cc9617`, `0e29bad`): five aligned voltage steps per loop, least-squares R and V_dt with residuals, ΔR/R → winding ΔT at 0.393 %/K. Sensorless motor temperature, which the unpopulated NTC pad cannot provide.
+
+Bench image 445,936 B; 8,720 B free.
+
+**Not validated by any of this:** the phase-order fix (open-loop drive is indifferent to it — gate stays closed); anything closed-loop (AS5047 still unsoldered: no calibration, no position control has ever run); CAN (no adapter; the register block has never been read); servo output, 5 V rail sense, ToF; switching edges / EMI on the BSC016N06NS (not scoped).
+
+## Still gated (as of 2026-09-08)
+| Gate | Status | What unblocks it |
+|---|---|---|
+| CAN enumeration, telemetry, register block over the wire | not started | a CAN-FD adapter (fdcanusb or CANable-FD) |
+| Encoder bring-up on PC6 | not started | AS5047 soldered to the back side |
+| Config-write path (0x0807F000) survives power cycle | not started | `conf write` over CAN, then power cycle |
+| **Phase-order validation** | not started — open-loop spin cannot test it | encoder + current-limited `moteus_tool --calibrate`, watch convergence and phase currents. **Hard gate before closed-loop drive.** |
+| `vsense_adc_scale` trim onto `main` | on the bench branch only | port the one-line change from `0e29bad` |
+| Bring-up config: `servo.max_current_A` 25–30, `servo.vds_lvl_mv` 100–200, `servo.max_voltage` ≈ 38 (8S) | not applied | CAN |
+| Gate-drive edges / EMI for BSC016N06NS (inherited r4.11 currents) | drove ≤ 4.8 A without incident; edges not scoped | a scope on the first closed-loop spin |
+
