@@ -96,3 +96,51 @@ Bench image 445,936 B; 8,720 B free.
 | Bring-up config: `servo.max_current_A` 25–30, `servo.vds_lvl_mv` 100–200, `servo.max_voltage` ≈ 38 (8S) | not applied | CAN |
 | Gate-drive edges / EMI for BSC016N06NS (inherited r4.11 currents) | drove ≤ 4.8 A without incident; edges not scoped | a scope on the first closed-loop spin |
 
+
+## 2026-09-08 — first-spin telemetry, as read off the board
+
+Recorded because these figures existed only in a session transcript and a report agent (correctly)
+refused to publish them as unverifiable. All are direct reads of `g_bench_telemetry` over SWD
+during the stage-2 run (bench branch, `19df39b`..`8f28710`), or arithmetic on those reads.
+
+**Trajectory tracking.** At `seg_elapsed_ms 1957` of a 4,500 ms half-sine forward segment:
+- `seg_rotor_mrev 913` x 0.045 = **41.09 deg at the output**; the half-sine integral predicts
+  103 x (1 - cos(pi x 1957/4500))/2 = **41.0 deg**.
+- `cmd_rate_mrad_s 103,356` against a predicted 105,600 x sin(pi x 1957/4500) = **103,382**
+  (0.025 % error). An earlier sample: 336 measured vs 335 predicted at 291 ms.
+
+**Phase-current balance** (validates all three sense channels and the phase wiring together, since
+a star winding must sum to zero): `3142 / -2819 / -241 mA` -> sum **82 mA** against ~3,000 mA
+magnitudes. A second sample `2416 / -2739 / 483` -> 160 mA. At align, `644 / -241 / -402` -> **1 mA**.
+
+**Current-sense offsets** calibrate off the 2048 default to 2012-2050 and drift only a couple of
+LSB with temperature.
+
+**Thermal.** FET sensor 31.9 C idle -> plateau 37.3-38.7 C after ~140 s energised; **cold-start
+read 29.17 C at 4 s from power-up against 28 C ambient** (two independent references on a nearby
+3D printer), which is what settles the thermistor question below.
+
+**Endurance.** 8 loops, ~140 s energised, `abort_reason 0`, `servo_fault 0`, `drv_bits 0` throughout.
+
+> Gotcha, 2026-09-08: the very first energisation attempt **aborted on a false overcurrent** — the
+> DRV8353's current-sense amps output 0 V while the driver sleeps, so with the default 2048 offset
+> all three phases read a rail of **-164,999 mA** ((0 - 2048) x 80.57 mA), and the abort check was
+> evaluated before the drive chain was ready. Fixed by gating current checks on `servo_mode == 7`.
+> So "the gate driver came up" is true; "worked on the first attempt" is **not** a claim to publish.
+
+### Thermistor question — CLOSED 2026-09-08
+The FET thermistor is honest. A cold-start read of **29.17 C at 4 s** against 28 C ambient leaves no
+room for a meaningful offset; the 31-32 C seen "at rest" in earlier runs was genuine buck and MCU
+self-heating, as Aditya proposed. **No calibration change needed.** The motor NTC is a separate
+matter — the pad is unpopulated (`motor_ntc_raw` reads 10-15, i.e. nothing) and needs a part fitted
+before it can be calibrated; `motor_thermistor_ohm` is config, so no rebuild will be required.
+
+### Still open from this run
+- `vsense_adc_scale` 0.067944 -> **0.069540** exists **only on `bench/openloop-test`**. Main still
+  carries the old value. Port it once confirmed with three simultaneous DMM/board readings at rest.
+- The V-I sweep's phase-resistance fit **failed all five acceptance criteria** (R 295,122 uOhm
+  outside the 330k-440k window, rms residual 149 mA, max 249 mA, imbalance 805 mA, V_dt 312 mV).
+  Cause: the rotor moves during the sweep — gearbox backlash plus almost no damping, re-excited by
+  each voltage step. Incremental slopes still cluster at **0.37-0.42 Ohm** and **0.2195 Ohm is
+  definitively excluded**. Fix: clamp the output shaft mechanically, and replace the stepped sweep
+  with a slow continuous voltage ramp plus per-sample motion rejection.

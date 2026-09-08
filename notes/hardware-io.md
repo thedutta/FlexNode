@@ -19,7 +19,7 @@ _Recorded 2026-09-07 01:35 IST, from `fw/moteus_controller.cc:401-500` (family-0
 | ToF INT | PB10 | EXTI | |
 | Debug / GPIO | PC14 / PC15 | nothing | aux2 pins 2–3 |
 | WS2812 | PF0 | bit-banged, DWT-timed | status LED, see [`ws2812-led.md`](ws2812-led.md) |
-| Rotor encoder | PC6 (CS) | SPI1 | AS5047P, **not yet soldered** |
+| Rotor encoder | PC6 (CS) | **SPI2? see gotcha** | AS5047P, **not yet soldered** |
 
 > Gotcha, 2026-09-07 02:40 IST: **"PC13 has no timer" is false as a hardware claim** — I recorded
 > it that way earlier. It has no timer *in the moteus aux table*. The G474 maps `PC_13` to
@@ -28,6 +28,14 @@ _Recorded 2026-09-07 01:35 IST, from `fw/moteus_controller.cc:401-500` (family-0
 > over TIM1_CH1N because TIM1 is wanted for the SimpleFOC Mini below. The RTC-domain drive
 > caveats (weak ~3 mA, slow slew) still stand. Lesson: an absent entry in a vendor table is not an
 > absent capability in the silicon.
+
+> ⚠️ Gotcha, 2026-09-08: **the AS5047 may be on SPI2 = PB13/PB14/PB15, not SPI1.** This file
+> previously recorded SPI1. For family 0 the onboard AS5047 appears to ride **SPI2**
+> (`moteus_controller.cc:409-411,518-520`, `aux_mbed.h:604-605`, upstream `encoders.md:188-190`).
+> If true, the "SPI expansion pads" **are the rotor-encoder bus**, and the plan to drive a
+> SimpleFOC Mini from TIM1_CH1N/2N/3N on those same pins collides with the one peripheral the axis
+> cannot lose. **This is now the deciding question for the Mini, and it is a netlist check on the
+> real board, not a code read.** Trace PB13/14/15 and the AS5047 before any `bldc_ext` work.
 
 > Gotcha, 2026-09-07 01:35 IST: **the aux hardware tables are still stock moteus r4 pinouts.**
 > `GetAux1HardwareConfig()` / `GetAux2HardwareConfig()` in `fw/moteus_controller.cc` were never

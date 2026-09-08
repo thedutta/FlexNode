@@ -385,11 +385,32 @@ The Jetson is explicitly "allowed to be slow, and allowed to crash". A 4.8 kg ma
 
 Three graded levels. **G0 is always on. G1 and G2 are opt-in and default off.**
 
-### G0 — Independent timeout (stock moteus, always active)
+### G0 — Independent timeout (stock moteus)
 
-Each node already runs a command watchdog: `servo.default_timeout_s` (default 0.1 s) drops the axis into **timeout mode (11)** with configured behaviour. No new code, no bus traffic, no coordination, no shared failure mode. Extended only by config: per-node timeout action (hold position / relax / current-limited hold) and the same for each channel — channels go to `mode = 0` (released) which is why released is the boot default.
+Each node runs a command watchdog: `servo.default_timeout_s` (default 0.1 s) drops the axis into
+**timeout mode (11)**. No new code, no bus traffic, no coordination, no shared failure mode.
+Extended only by config: per-node timeout action and the same per channel — channels go to
+`mode = 0` (released), which is why released is the boot default.
 
-**This is the floor and it is never disabled.** Everything below is an optimisation on top of a system that is already safe.
+> ⚠️ **Correction, 2026-09-08 — G0 is narrower than this document previously claimed.** An earlier
+> revision called it "the floor, never disabled". Measured against source
+> (`bldc_servo_control.h:1670-1674`), **the watchdog only fires in mode 10 (position) and mode 13
+> (stay-within).** A node commanded in **current, voltage, voltage-FOC, brake or zero-velocity mode
+> has no watchdog at all** and will hold its last command indefinitely if the host stops talking.
+>
+> And **recovery is not automatic**: leaving timeout mode requires an explicit **stop** command
+> first (`bldc_servo_control.h:1620-1622`). The statement in
+> `reports/2026-09-08-can-subsystem-design.md` that the next frame re-arms it **is wrong**.
+>
+> Consequences for CATBOT, neither fatal but both must be designed for:
+> 1. Gait commands are position mode, so the fleet's normal operating mode *is* covered — but any
+>    node parked in current or voltage mode for tuning, calibration or a bench test is **not**.
+>    Treat "commanded in a non-position mode" as a state with no safety net.
+> 2. The corenode's recovery path must send **stop** before re-commanding a timed-out node, or the
+>    node stays in timeout and the joint stays limp while the host thinks it is commanding it.
+
+Everything below is an optimisation on top of this, and the narrowness above is exactly why G1's
+beacon and the per-channel released-at-boot default matter more than they first appeared.
 
 ### G1 — Coordinated safe state (broadcast, no election)
 
@@ -531,6 +552,17 @@ Four constraints, none fatal but all easy to trip over:
   Do not enable TIM1 BRK interrupts.
 - **A shoulder node with both a Mini and a DS3235 cannot put the servo on TIM1_CH1N/PC13** — same
   channel as PB13. Use **TIM8_CH4N** for the servo, per §9.1.
+
+> ⚠️ **Possible conflict found 2026-09-08 — this may kill the whole option.** For family 0 the
+> **onboard AS5047 encoder appears to ride SPI2, i.e. PB13/PB14/PB15**
+> (`moteus_controller.cc:409-411,518-520`, `aux_mbed.h:604-605`, upstream `encoders.md:188-190`).
+> If that is what the FlexNode PCB actually does, those "SPI expansion pads" **are the encoder bus**,
+> and using them for TIM1 PWM would collide with the rotor encoder — the one peripheral the axis
+> cannot do without. `notes/hardware-io.md` previously recorded the AS5047 as being on SPI1; that
+> may be wrong.
+>
+> **This is now the deciding question for option 2, and it is a netlist check, not a code read.**
+> Trace PB13/PB14/PB15 and the AS5047 on the real board before any further work on `bldc_ext`.
 
 Pad presence on the CEU6 is still Aditya's netlist to confirm.
 
