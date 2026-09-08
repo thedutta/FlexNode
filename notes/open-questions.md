@@ -66,14 +66,11 @@ Breathe/chase modes (0x0B0 = 2/3) are reserved and currently treated as solid. P
 Bench photos: one first-light photo is live. More can go in as milestones land. The subagent handles it; give it facts, never let it invent images or numbers.
 
 ## 8. Fleet questions raised by the v2 CAN design (2026-09-07)
-- **10 vs 13 nodes.** Published actuator list is 4 GIM8108-8 hips + 6 5010 knees = 10 BLDC (one
-  FlexNode each), plus 2 head gimbals on a SimpleFOC dual driver and 7 servos on aux ports. The
-  "thirteen nodes" figure is unreconciled. Assumed 10 actuator + 3 non-actuator. Changes the
-  profile mix, not the protocol.
-- **Brainstem MCU: G0 or G4?** The site says STM32G0 in one place ("zero-watt acoustic wake") and
-  STM32G4 in another ("spinal cord driving two chains"). **G0 has no FDCAN.** If the brainstem is
-  to be the Phase-B realtime bus master it must be a G4 (3x FDCAN). This decides whether the
-  two-chain topology — the thing that buys 400 Hz+ — is reachable at all. Settle early.
+- **10 vs 13 nodes — RESOLVED 2026-09-08.** Ten FlexNodes: 4 GIM8108-8 hips + 6 5010 knees, one
+  node each; 2 head gimbals on a SimpleFOC dual driver and 7 servos on aux ports. Twelve boards
+  were ordered for attrition, which is where "thirteen" crept in. Profile mix: 10 actuator nodes,
+  no dedicated non-actuator nodes.
+- **Brainstem MCU — RESOLVED 2026-09-08.** CoreNode is STM32G474RET6 (G4). The STM32G0 mention on the site was stale and has been corrected.
 - **Is the Jetson on the CAN bus in production, or only behind the brainstem?** Determines whether
   there are two masters and where the G1 presence beacon originates.
 - **G2 deputy is the most dangerous idea in the design.** A node that can command its peers can do

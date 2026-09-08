@@ -14,13 +14,13 @@ Building a legged robot today means building three projects: the robot, its elec
 
 Each FlexNode is one node per joint: it closes a hard-real-time field-oriented control loop locally (15–30 kHz), reads its own IMU and time-of-flight sensor, and exposes ports for whatever the joint needs — an external RC servo, an AS5600L joint encoder, a load cell for foot contact, addressable status LEDs. Everything reports and commands over a single daisy-chained CAN-FD pair. One firmware image serves every node; per-node behavior is *configuration*, not code. A host — a Jetson, a laptop, a Raspberry Pi — composes queries per node and gets exactly the telemetry it asks for, at gait-loop rates.
 
-The result: a 21-DoF sensor-fused quadruped's entire electronics stack is one identical board per BLDC actuator, two wires between them, and a config file. That is sweet for CATBOT (the robot this was built for), and just as sweet for anyone else building anything with motors and sensors on it.
+The result: a 21-DoF sensor-fused quadruped's entire electronics stack is ten identical boards (one per BLDC actuator; twelve were ordered for attrition), two wires between them, and a config file. That is sweet for CATBOT (the robot this was built for), and just as sweet for anyone else building anything with motors and sensors on it.
 
 ## What it is
 
 FlexNode is a compact 4-layer PCB that fuses a **field-oriented motor controller** and a **sensor-fusion front end** into a single CAN-FD bus node. It began as a fork of the [mjbots **moteus r4.11**](https://github.com/mjbots/moteus) controller — the proven power stage, gate driver, STM32G4 core, FOC firmware, and register protocol are kept intact — and adds the digital sensing and I/O a distributed robot node needs:
 
-- **6-axis IMU** (accel + gyro) for per-node inertial sensing — one per node makes a distributed IMU array
+- **6-axis IMU** (accel + gyro) for per-node inertial sensing — ten nodes make a distributed IMU array
 - **Multizone time-of-flight** ranging (8×8) for proximity / terrain
 - **Servo / Aux port** with onboard 5 V current sensing (stall detection)
 - **Dedicated I²C port** for AS5600L-class joint encoders or any I²C peripheral
