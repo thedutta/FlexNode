@@ -1,0 +1,13 @@
+FlexNode
+Copyright 2025-2026 Aditya Dutta
+
+This product includes hardware and firmware derived from moteus
+(https://github.com/mjbots/moteus), Copyright 2018-2024 Josh Pieper,
+jjp@pobox.com, licensed under the Apache License, Version 2.0.
+The power stage, gate-driver topology, STM32G4 core, FOC firmware and
+CAN register protocol follow that project. Files modified from moteus
+carry a "changed by" notice; the upstream tree is preserved intact in
+moteus-r4-parent/ together with its original LICENSE.
+
+"moteus" and "mjbots" are trademarks of mjbots Robotic Systems LLC.
+FlexNode is moteus-compatible and is not endorsed by or affiliated with mjbots.

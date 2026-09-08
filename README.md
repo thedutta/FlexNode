@@ -2,7 +2,7 @@
 
 **A distributed compute node for mobile robots — high-current FOC actuation and sensor fusion, all over CAN-FD.**
 
-> ⚠️ **Work in progress — first article booted 2026-09-06.** A v1.0 board powers up, boots from flash, and runs the FlexNode firmware (status LED live, servo in stopped mode). Still unvalidated: CAN enumeration, bus-voltage telemetry, the encoder (not yet fitted), and anything that energizes the gate driver. Expect breaking changes until the first article is fully proven.
+> ⚠️ **Work in progress — first article booted 2026-09-06, first motor spin under FOC 2026-09-08.** A v1.0 board powers up, boots from flash, runs the FlexNode firmware, and has driven a GIM 8108-8 open-loop from its own power stage (DRV8353S, all three phase-current channels, bus-voltage sense and FET thermals validated). Still unvalidated: closed-loop FOC and calibration (encoder not yet fitted), the phase-order fix on hardware, CAN enumeration, ToF and aux current sense. Expect breaking changes until the first article is fully proven.
 
 ---
 
@@ -14,13 +14,13 @@ Building a legged robot today means building three projects: the robot, its elec
 
 Each FlexNode is one node per joint: it closes a hard-real-time field-oriented control loop locally (15–30 kHz), reads its own IMU and time-of-flight sensor, and exposes ports for whatever the joint needs — an external RC servo, an AS5600L joint encoder, a load cell for foot contact, addressable status LEDs. Everything reports and commands over a single daisy-chained CAN-FD pair. One firmware image serves every node; per-node behavior is *configuration*, not code. A host — a Jetson, a laptop, a Raspberry Pi — composes queries per node and gets exactly the telemetry it asks for, at gait-loop rates.
 
-The result: a 13-DOF sensor-fused quadruped's entire electronics stack is thirteen identical boards, two wires between them, and a config file. That is sweet for CATBOT (the robot this was built for), and just as sweet for anyone else building anything with motors and sensors on it.
+The result: a 21-DoF sensor-fused quadruped's entire electronics stack is one identical board per BLDC actuator, two wires between them, and a config file. That is sweet for CATBOT (the robot this was built for), and just as sweet for anyone else building anything with motors and sensors on it.
 
 ## What it is
 
 FlexNode is a compact 4-layer PCB that fuses a **field-oriented motor controller** and a **sensor-fusion front end** into a single CAN-FD bus node. It began as a fork of the [mjbots **moteus r4.11**](https://github.com/mjbots/moteus) controller — the proven power stage, gate driver, STM32G4 core, FOC firmware, and register protocol are kept intact — and adds the digital sensing and I/O a distributed robot node needs:
 
-- **6-axis IMU** (accel + gyro) for per-node inertial sensing — thirteen nodes make a distributed IMU array
+- **6-axis IMU** (accel + gyro) for per-node inertial sensing — one per node makes a distributed IMU array
 - **Multizone time-of-flight** ranging (8×8) for proximity / terrain
 - **Servo / Aux port** with onboard 5 V current sensing (stall detection)
 - **Dedicated I²C port** for AS5600L-class joint encoders or any I²C peripheral
@@ -80,7 +80,7 @@ Choices worth reading the docs for:
 
 FlexNode and CATBOT are **independently designed and built by [Aditya Dutta](https://thedutta.github.io)**, a third-year undergraduate at **Manipal Institute of Technology, Bengaluru** — no lab budget, no research group, no sponsor: one student, open-source tools, and JLCPCB.
 
-**CATBOT** is the driving target: a ~4 kg, 13-DOF, super-agile jumping quadruped — high-torque geared hips, lightweight leg motors, a Jetson for perception and locomotion policies, and one FlexNode per actuator fused into a whole-body sensor network. The ambition is deliberately at the edge of what an individual can build: dynamic, sensor-rich legged locomotion of the kind usually gated behind institutional hardware.
+**CATBOT** is the driving target: a 4.9 kg, 21-DoF, super-agile jumping quadruped — high-torque geared hips, lightweight leg motors, a Jetson for perception and locomotion policies, and one FlexNode per actuator fused into a whole-body sensor network. The ambition is deliberately at the edge of what an individual can build: dynamic, sensor-rich legged locomotion of the kind usually gated behind institutional hardware.
 
 The method makes that possible: **stand on proven open source and extend it honestly.** moteus contributes a decade of motor-control engineering; FlexNode contributes the distributed-sensing node architecture, the CATBOT-specific hardware, and the documentation trail — and gives all of it back under the same license. Every schematic, BOM line, firmware delta, and design decision in this repo is public precisely so the next student can start where this project stands instead of where it started.
 
@@ -103,6 +103,7 @@ FlexNode's files live at the repo root; the upstream **moteus r4** project this 
 │   ├── manufacturing/           BOM, gerber archive, pick-and-place
 │   └── gerbers/                 unpacked gerbers
 ├── LICENSE                      Apache-2.0 (inherited from moteus)
+├── NOTICE                       attribution to moteus / mjbots, trademark note
 └── moteus-r4-parent/            ← the moteus r4.11 fork FlexNode builds on
     ├── fw/ hw/ lib/ tools/ …    moteus firmware + build system
     ├── README.md                moteus's own readme
@@ -115,13 +116,15 @@ FlexNode's files live at the repo root; the upstream **moteus r4** project this 
 
 ## Status
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the live checklist. In short: **first article assembled and booted (2026-09-06) · power tree, flash boot and status LED validated · CAN layer designed, not yet implemented · motor and encoder bring-up next.** Nothing on the drive side is hardware-validated yet; current-limited phase-order validation gates motor operation.
+See [`docs/roadmap.md`](docs/roadmap.md) for the live checklist. In short: **first article assembled and booted (2026-09-06) · power tree, flash boot, status LED and IMU validated · first spin 2026-09-08: power stage, phase-current sense, bus sense and FET thermals validated with open-loop drive · CAN layer designed, not yet implemented · encoder fit, closed-loop FOC, phase-order verification and CAN bring-up next.**
 
 ## Credits & license
 
 FlexNode derives from the **mjbots moteus r4.11** open-hardware controller by Josh Pieper ([mjbots/moteus](https://github.com/mjbots/moteus), Apache-2.0). The power stage, gate-driver topology, STM32G4 core, FOC firmware, and CAN register protocol follow that project; the sensing suite, distributed-node architecture, CATBOT-specific hardware, and firmware deltas are FlexNode's.
 
-This repository is licensed **Apache-2.0** (`LICENSE` at the root), inherited from moteus and covering FlexNode's additions unless a specific file states otherwise. moteus's original license is preserved in `moteus-r4-parent/LICENSE`. Retain the moteus attribution and the upstream link.
+This repository is licensed **Apache-2.0** (`LICENSE` at the root), inherited from moteus and covering FlexNode's additions unless a specific file states otherwise. Attribution and modification notices required by Apache §4 are collected in `NOTICE`; moteus's original license is preserved in `moteus-r4-parent/LICENSE`. Retain the moteus attribution and the upstream link.
+
+"moteus" and "mjbots" are trademarks of mjbots Robotic Systems LLC. FlexNode is **moteus-compatible** (speaks the moteus register protocol and works with `moteus_tool` and fdcanusb) and is not endorsed by or affiliated with mjbots.
 
 Author: **Aditya Dutta** · Manipal Institute of Technology, Bengaluru · Project: **CATBOT**
 
